@@ -43,6 +43,7 @@ ROUTER_DROPOUT=${ROUTER_DROPOUT:-0.1}
 ROUTER_DTYPE=${ROUTER_DTYPE:-float32}
 
 PROJECTOR_TRAIN_MODE=${PROJECTOR_TRAIN_MODE:-full}
+DEVICE=${DEVICE:-cuda:0}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-e2e_receiver_latent_switch_openhermes_4expert_projector_full_${NUM_SAMPLES}_ep${EPOCHS}}
 
@@ -93,7 +94,7 @@ python -u script/train/train_router_e2e_softgate.py \
   --latent-max-encoder-tokens "$LATENT_MAX_ENCODER_TOKENS" \
   --projector-train-mode "$PROJECTOR_TRAIN_MODE" \
   --expert-dropout "$EXPERT_DROPOUT" \
-  --device cuda:0 \
+  --device "$DEVICE" \
   --wandb \
   --wandb-project C2C \
   --wandb-entity june6-hanyang-university \
