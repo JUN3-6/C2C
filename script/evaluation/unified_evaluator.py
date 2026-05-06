@@ -30,6 +30,8 @@ import re
 import sys
 import re
 import hashlib
+import joblib
+from torch import nn
 
 from rosetta.utils.evaluate import (
     extract_answer_from_content,
@@ -46,6 +48,63 @@ from rosetta.train.dataset_adapters import generate_kv_cache_index
 from transformers import AutoTokenizer
 from rosetta.utils.evaluate import set_default_chat_template
 from rosetta.baseline.multi_stage import TwoStageInference, TwoStageRosetta
+
+
+class _TorchCorrectnessDetectorNet(nn.Module):
+    def __init__(self, input_dim: int, architecture: str, hidden_dim: int, dropout: float):
+        super().__init__()
+        if architecture == "linear":
+            self.net = nn.Linear(input_dim, 1)
+        elif architecture == "mlp":
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            raise ValueError(f"Unknown torch correctness detector architecture: {architecture}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+class _TorchCorrectnessDetectorWrapper:
+    def __init__(self, checkpoint: Dict[str, Any]):
+        def _as_numpy(value):
+            if value is None:
+                return np.asarray([], dtype=np.float32)
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy().astype(np.float32)
+            return np.asarray(value, dtype=np.float32)
+
+        self.mean = _as_numpy(checkpoint.get("feature_mean"))
+        self.std = _as_numpy(checkpoint.get("feature_std"))
+        input_dim = int(checkpoint["input_dim"])
+        if self.mean.size == 0:
+            self.mean = np.zeros((1, input_dim), dtype=np.float32)
+        if self.std.size == 0:
+            self.std = np.ones((1, input_dim), dtype=np.float32)
+        self.std = np.where(np.abs(self.std) < 1e-6, 1.0, self.std).astype(np.float32)
+        self.model = _TorchCorrectnessDetectorNet(
+            input_dim=input_dim,
+            architecture=str(checkpoint.get("architecture", "mlp")),
+            hidden_dim=int(checkpoint.get("hidden_dim", 64)),
+            dropout=float(checkpoint.get("dropout", 0.0)),
+        )
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.model.eval()
+
+    def predict_proba(self, features: np.ndarray) -> np.ndarray:
+        x = (np.asarray(features, dtype=np.float32) - self.mean) / self.std
+        with torch.no_grad():
+            logits = self.model(torch.from_numpy(x))
+            probs = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+        return np.stack([1.0 - probs, probs], axis=1)
+
 
 # Dataset-specific configurations
 DATASET_CONFIGS = {
@@ -142,6 +201,13 @@ DATASET_CONFIGS = {
         ],
         "subcategories": {},  # MMMLU doesn't have subcategories
         "categories": {}  # MMMLU doesn't have categories
+    },
+    "mmlu-auxiliary": {
+        "dataset_name": "cais/mmlu",
+        "test_split": "auxiliary_train",
+        "subjects": ["all"],
+        "subcategories": {},
+        "categories": {},
     },
 
     "gpqa": {
@@ -272,6 +338,8 @@ class UnifiedEvaluator:
         # Debug options
         self.debug_dump_bad_samples = bool(self.eval_config.get("debug_dump_bad_samples", True))
         self.cuda_launch_blocking = bool(self.eval_config.get("cuda_launch_blocking", False))
+        self._correctness_detector = None
+        self._correctness_detector_config = None
         
         # Check if using two-stage based on model_name
         self.use_two_stage = self.model_config["model_name"].lower() in ["two_stage", "two_stage_rosetta"]
@@ -328,6 +396,134 @@ class UnifiedEvaluator:
             print(f"Saved bad sample to {dump_path}")
         except Exception as e:
             print(f"Failed to dump bad sample for {subject} #{question_id}: {e}")
+
+    @staticmethod
+    def _empty_entropy_gate_metrics() -> Dict[str, Optional[float]]:
+        return {
+            "entropy_gate_opportunity": None,
+            "entropy_gate_checked": None,
+            "entropy_gate_allowed": None,
+            "entropy_gate_blocked": None,
+            "entropy_gate_skip_rate": None,
+        }
+
+    def _extract_entropy_gate_metrics(self, model) -> Dict[str, Optional[float]]:
+        metrics = self._empty_entropy_gate_metrics()
+        if not isinstance(model, RosettaModel):
+            return metrics
+
+        stats = getattr(model, "entropy_gate_stats", None)
+        if isinstance(stats, dict) and any(k in stats for k in ("opportunity_total", "blocked_total")):
+            opportunity = int(stats.get("opportunity_total", 0))
+            checked = int(stats.get("checked_total", 0))
+            allowed = int(stats.get("allowed_total", 0))
+            blocked = int(stats.get("blocked_total", 0))
+            if opportunity > 0 or checked > 0 or allowed > 0 or blocked > 0:
+                metrics.update({
+                    "entropy_gate_opportunity": opportunity,
+                    "entropy_gate_checked": checked,
+                    "entropy_gate_allowed": allowed,
+                    "entropy_gate_blocked": blocked,
+                    "entropy_gate_skip_rate": (blocked / opportunity) if opportunity > 0 else None,
+                })
+                return metrics
+
+        state = getattr(model, "last_entropy_gate_state", None) or {}
+        sources = state.get("sources", {})
+        if not isinstance(sources, dict) or not sources:
+            return metrics
+
+        base_entropy = state.get("base_entropy")
+        opportunity = len(sources)
+        checked = 0
+        allowed = 0
+        blocked = 0
+        for source_info in sources.values():
+            allow_fusion = source_info.get("allow_fusion")
+            source_entropy = source_info.get("source_entropy")
+            if base_entropy is not None and source_entropy is not None:
+                checked += 1
+            if allow_fusion is True:
+                allowed += 1
+            elif allow_fusion is False:
+                blocked += 1
+
+        metrics.update({
+            "entropy_gate_opportunity": opportunity,
+            "entropy_gate_checked": checked,
+            "entropy_gate_allowed": allowed,
+            "entropy_gate_blocked": blocked,
+            "entropy_gate_skip_rate": (blocked / opportunity) if opportunity > 0 else None,
+        })
+        return metrics
+
+    @staticmethod
+    def _empty_router_metrics() -> Dict[str, Optional[float]]:
+        return {
+            "router_decision_count": None,
+            "router_fuse_count": None,
+            "router_skip_count": None,
+            "router_fuse_rate": None,
+            "router_skip_rate": None,
+            "router_should_fuse": None,
+            "router_selected_bank": None,
+            "router_skip_probability": None,
+        }
+
+    @staticmethod
+    def _snapshot_router_stats(model) -> Optional[Dict[str, Any]]:
+        if not isinstance(model, RosettaModel):
+            return None
+        stats = getattr(model, "routing_stats", None)
+        if not isinstance(stats, dict):
+            return None
+        return {
+            "decision_total": int(stats.get("decision_total", 0)),
+            "fuse_total": int(stats.get("fuse_total", 0)),
+            "skip_total": int(stats.get("skip_total", 0)),
+            "bank_counts": dict(stats.get("bank_counts", {}) or {}),
+        }
+
+    def _extract_router_metrics(
+        self,
+        model,
+        before_stats: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[float]]:
+        metrics = self._empty_router_metrics()
+        if not isinstance(model, RosettaModel):
+            return metrics
+
+        after_stats = self._snapshot_router_stats(model)
+        if after_stats is not None and before_stats is not None:
+            decisions = after_stats["decision_total"] - before_stats["decision_total"]
+            fuses = after_stats["fuse_total"] - before_stats["fuse_total"]
+            skips = after_stats["skip_total"] - before_stats["skip_total"]
+            if decisions > 0:
+                metrics.update({
+                    "router_decision_count": decisions,
+                    "router_fuse_count": fuses,
+                    "router_skip_count": skips,
+                    "router_fuse_rate": fuses / decisions,
+                    "router_skip_rate": skips / decisions,
+                })
+
+        state = getattr(model, "last_routing_state", None) or {}
+        if isinstance(state, dict) and state:
+            should_fuse = state.get("should_fuse")
+            selected_bank = state.get("selected_bank")
+            action_probabilities = state.get("action_probabilities")
+            try:
+                if should_fuse is not None:
+                    metrics["router_should_fuse"] = bool(should_fuse.view(-1)[0].item())
+                if selected_bank is not None:
+                    metrics["router_selected_bank"] = int(selected_bank.view(-1)[0].item())
+                if action_probabilities is not None:
+                    metrics["router_skip_probability"] = float(
+                        action_probabilities.view(-1, action_probabilities.shape[-1])[0, 0].item()
+                    )
+            except Exception:
+                pass
+        return metrics
     
     def format_example(self, example: Dict[str, Any], use_cot: bool = True) -> str:
         """
@@ -342,7 +538,7 @@ class UnifiedEvaluator:
         """
         if self.dataset_name == "mmmlu":
             return self._format_mmmlu_example(example, use_cot)
-        elif self.dataset_name == "mmlu-redux":
+        elif self.dataset_name in ["mmlu-redux", "mmlu-auxiliary"]:
             return self._format_mmlu_redux_example(example, use_cot)
         elif self.dataset_name == "gpqa":
             return self._format_gpqa_example(example, use_cot)
@@ -654,6 +850,12 @@ class UnifiedEvaluator:
                 answer_num = int(example['answer'])
             
             return chr(65 + answer_num) if answer_num is not None else None
+        elif self.dataset_name == "mmlu-auxiliary":
+            answer_num = example.get('answer')
+            if answer_num is None:
+                return None
+            answer_num = int(answer_num)
+            return chr(65 + answer_num)
         elif self.dataset_name == "longbench":
             # For LongBench, we don't parse answers as we're generating text
             return None
@@ -752,6 +954,1041 @@ class UnifiedEvaluator:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             return result, float(elapsed_ms)
 
+    def _generation_kwargs(self, tokenizer) -> Dict[str, Any]:
+        kwargs = dict(self.generation_config)
+        if tokenizer.pad_token_id is not None and "pad_token_id" not in kwargs:
+            kwargs["pad_token_id"] = tokenizer.pad_token_id
+        if tokenizer.eos_token_id is not None and "eos_token_id" not in kwargs:
+            kwargs["eos_token_id"] = tokenizer.eos_token_id
+        return kwargs
+
+    @staticmethod
+    def _first_model_inputs(inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        first_inputs: Dict[str, torch.Tensor] = {}
+        for key in ("input_ids", "attention_mask"):
+            value = inputs.get(key)
+            if isinstance(value, (list, tuple)):
+                value = value[0]
+            if value is not None:
+                first_inputs[key] = value
+        return first_inputs
+
+    @staticmethod
+    def _choice_index(answer: Optional[str], num_options: int) -> Optional[int]:
+        if not answer:
+            return None
+        answer = str(answer).strip().upper()
+        if len(answer) != 1:
+            return None
+        idx = ord(answer) - ord("A")
+        return idx if 0 <= idx < num_options else None
+
+    @staticmethod
+    def _dual_answer_word_count(text: Optional[str]) -> int:
+        if not text:
+            return 0
+        return len(str(text).strip().split())
+
+    @staticmethod
+    def _option_entropy(probs: np.ndarray) -> float:
+        probs = np.asarray(probs, dtype=float)
+        probs = np.clip(probs, 1e-12, 1.0)
+        return float(-(probs * np.log(probs)).sum())
+
+    @staticmethod
+    def _top1_margin(probs: np.ndarray) -> float:
+        probs = np.asarray(probs, dtype=float)
+        if probs.size < 2:
+            return 0.0
+        top2 = np.partition(probs, -2)[-2:]
+        return float(top2.max() - top2.min())
+
+    @staticmethod
+    def _is_logits_answer_method(answer_method: str) -> bool:
+        return answer_method in {"logits", "dual_logits_select"}
+
+    @staticmethod
+    def _generate_sequences(generate_output):
+        return getattr(generate_output, "sequences", generate_output)
+
+    @staticmethod
+    def _generate_scores(generate_output) -> List[torch.Tensor]:
+        scores = getattr(generate_output, "scores", None)
+        return list(scores) if scores is not None else []
+
+    def _option_token_aliases(self, tokenizer, option: str, canonical_token_id: int) -> set:
+        aliases = {int(canonical_token_id)}
+        for text in (option, f" {option}", f"{option}.", f" {option}."):
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if ids:
+                aliases.add(int(ids[0]))
+        return aliases
+
+    def _generated_answer_token_confidence(
+        self,
+        *,
+        generated_ids: torch.Tensor,
+        scores: List[torch.Tensor],
+        pred: Optional[str],
+        option_ids: List[int],
+        tokenizer,
+    ) -> Dict[str, Any]:
+        """Confidence of the generated answer letter token from generation scores.
+
+        This avoids a second fixed-prefix logits forward. The default score is
+        the full-vocabulary probability of the actual generated answer token.
+        """
+        num_options = len(option_ids)
+        pred_idx = self._choice_index(pred, num_options)
+        if pred_idx is None or not scores:
+            return {"confidence": None, "token_position": None, "token_id": None}
+
+        aliases = self._option_token_aliases(
+            tokenizer,
+            str(pred).strip().upper(),
+            option_ids[pred_idx],
+        )
+        generated_list = generated_ids.detach().cpu().tolist()
+        normalization = self.eval_config.get(
+            "fusion_fallback_confidence_normalization",
+            "vocab",
+        )
+        option_index = None
+
+        for pos, token_id in enumerate(generated_list):
+            if int(token_id) not in aliases or pos >= len(scores):
+                continue
+            logits = scores[pos]
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            if normalization == "vocab":
+                prob = torch.softmax(logits[0].float(), dim=-1)[int(token_id)]
+            elif normalization == "option":
+                if option_index is None:
+                    option_index = torch.tensor(
+                        option_ids,
+                        dtype=torch.long,
+                        device=logits.device,
+                    )
+                option_logits = logits[0].index_select(0, option_index)
+                prob = torch.softmax(option_logits.float(), dim=-1)[pred_idx]
+            else:
+                raise ValueError(
+                    "fusion_fallback_confidence_normalization must be "
+                    "'vocab' or 'option', got "
+                    f"{normalization!r}"
+                )
+            return {
+                "confidence": float(prob.item()),
+                "token_position": int(pos),
+                "token_id": int(token_id),
+            }
+
+        return {"confidence": None, "token_position": None, "token_id": None}
+
+    @staticmethod
+    def _is_exact_dual_answer(text: Optional[str]) -> bool:
+        if not text:
+            return False
+        return re.fullmatch(
+            r"\s*The correct answer is [A-J]\.?\s*",
+            str(text),
+            flags=re.IGNORECASE,
+        ) is not None
+
+    def _receiver_output_passes_dual_guard(self, receiver_text: Optional[str]) -> bool:
+        """Optional guard: only trust receiver when its generation follows the requested format."""
+        max_words = self.eval_config.get("dual_generate_receiver_max_words")
+        if max_words is not None:
+            try:
+                if self._dual_answer_word_count(receiver_text) > int(max_words):
+                    return False
+            except (TypeError, ValueError):
+                raise ValueError("dual_generate_receiver_max_words must be an integer")
+
+        exact_only = bool(self.eval_config.get("dual_generate_receiver_exact_answer_only", False))
+        if exact_only and not self._is_exact_dual_answer(receiver_text):
+            return False
+
+        return True
+
+    def _score_dual_generate_candidates(
+        self,
+        *,
+        prompt: str,
+        model: RosettaModel,
+        tokenizer,
+        device: torch.device,
+        model_type: str,
+        llm_tokenizer: Optional[Any],
+        proportion: float,
+        order_mode: str,
+        option_ids: List[int],
+        receiver_pred: Optional[str],
+        fusion_pred: Optional[str],
+    ) -> Dict[str, Any]:
+        """Score generated receiver/fusion answers using fixed-prefix option confidence."""
+        num_options = len(option_ids)
+        logits_prepared = self.prepare_model_inputs(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            device=device,
+            model_type=model_type,
+            llm_tokenizer=llm_tokenizer,
+            answer_method="logits",
+            proportion=proportion,
+            order_mode=order_mode,
+        )
+        source_scores = self._score_receiver_fusion_option_logits(
+            prepared=logits_prepared,
+            model=model,
+            option_ids=option_ids,
+        )
+        receiver_probs = np.asarray(source_scores["receiver_probs"], dtype=float)
+        fusion_probs = np.asarray(source_scores["fusion_probs"], dtype=float)
+
+        receiver_idx = self._choice_index(receiver_pred, num_options)
+        fusion_idx = self._choice_index(fusion_pred, num_options)
+        receiver_score = (
+            float(receiver_probs[receiver_idx])
+            if receiver_idx is not None
+            else float("-inf")
+        )
+        fusion_score = (
+            float(fusion_probs[fusion_idx])
+            if fusion_idx is not None
+            else float("-inf")
+        )
+        return {
+            "receiver_score": receiver_score,
+            "fusion_score": fusion_score,
+            "receiver_probs": receiver_probs,
+            "fusion_probs": fusion_probs,
+            "receiver_option_logits": source_scores["receiver_option_logits"],
+            "fusion_option_logits": source_scores["fusion_option_logits"],
+        }
+
+    def _score_receiver_fusion_option_logits(
+        self,
+        *,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        """Run receiver-only and fusion forwards, then return option logits/probs."""
+        receiver_inputs = self._first_model_inputs(prepared["inputs"])
+        device = receiver_inputs["input_ids"].device
+        option_index = torch.tensor(option_ids, dtype=torch.long, device=device)
+
+        receiver_model = model.model_list[model.base_model_idx]
+        receiver_outputs = receiver_model(**receiver_inputs)
+        receiver_option_logits = receiver_outputs.logits[0, -1].index_select(
+            dim=0,
+            index=option_index,
+        )
+        receiver_probs = torch.softmax(receiver_option_logits.float(), dim=-1)
+
+        fusion_outputs = model.forward(**prepared["inputs"])
+        fusion_option_logits = fusion_outputs.logits[0, -1].index_select(
+            dim=0,
+            index=option_index,
+        )
+        fusion_probs = torch.softmax(fusion_option_logits.float(), dim=-1)
+
+        return {
+            "receiver_option_logits": receiver_option_logits.detach().float().cpu().numpy(),
+            "fusion_option_logits": fusion_option_logits.detach().float().cpu().numpy(),
+            "receiver_probs": receiver_probs.detach().cpu().numpy(),
+            "fusion_probs": fusion_probs.detach().cpu().numpy(),
+        }
+
+    @staticmethod
+    def _safe_log_probs(probs: np.ndarray) -> np.ndarray:
+        return np.log(np.clip(np.asarray(probs, dtype=float), 1e-12, 1.0))
+
+    @staticmethod
+    def _kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+        p = np.clip(np.asarray(p, dtype=float), 1e-12, 1.0)
+        q = np.clip(np.asarray(q, dtype=float), 1e-12, 1.0)
+        return float((p * (np.log(p) - np.log(q))).sum())
+
+    @staticmethod
+    def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
+        p = np.clip(np.asarray(p, dtype=float), 1e-12, 1.0)
+        q = np.clip(np.asarray(q, dtype=float), 1e-12, 1.0)
+        m = 0.5 * (p + q)
+        return 0.5 * UnifiedEvaluator._kl_divergence(p, m) + 0.5 * UnifiedEvaluator._kl_divergence(q, m)
+
+    @staticmethod
+    def _correctness_feature_from_probs(
+        receiver_probs: np.ndarray,
+        fusion_probs: np.ndarray,
+        feature_set: str = "basic38",
+    ) -> np.ndarray:
+        receiver = np.asarray(receiver_probs, dtype=float)
+        fusion = np.asarray(fusion_probs, dtype=float)
+        if receiver.shape != fusion.shape:
+            raise ValueError(
+                "receiver/fusion prob shape mismatch: "
+                f"{receiver.shape} vs {fusion.shape}"
+            )
+
+        num_options = receiver.shape[0]
+        receiver_top = int(receiver.argmax())
+        fusion_top = int(fusion.argmax())
+        receiver_sorted = np.sort(receiver)
+        fusion_sorted = np.sort(fusion)
+
+        def one_hot(idx: int) -> List[float]:
+            values = [0.0] * num_options
+            if 0 <= idx < num_options:
+                values[idx] = 1.0
+            return values
+
+        if feature_set in {"basic", "basic38"}:
+            features: List[float] = []
+            features.extend(receiver.tolist())
+            features.extend(fusion.tolist())
+            features.extend((receiver - fusion).tolist())
+            features.extend((receiver / np.clip(fusion, 1e-12, None)).tolist())
+            features.extend(one_hot(receiver_top))
+            features.extend(one_hot(fusion_top))
+            features.extend([
+                float(receiver[receiver_top]),
+                float(fusion[fusion_top]),
+                float(receiver[receiver_top] - fusion[fusion_top]),
+                UnifiedEvaluator._top1_margin(receiver),
+                UnifiedEvaluator._top1_margin(fusion),
+                UnifiedEvaluator._top1_margin(receiver) - UnifiedEvaluator._top1_margin(fusion),
+                UnifiedEvaluator._option_entropy(receiver),
+                UnifiedEvaluator._option_entropy(fusion),
+                UnifiedEvaluator._option_entropy(fusion) - UnifiedEvaluator._option_entropy(receiver),
+                float(receiver_top == fusion_top),
+                float(receiver[fusion_top]),
+                float(fusion[receiver_top]),
+                float(receiver[receiver_top] - receiver[fusion_top]),
+                float(fusion[fusion_top] - fusion[receiver_top]),
+                float(receiver_sorted[-1] - receiver_sorted[-2]) if num_options >= 2 else 0.0,
+                float(fusion_sorted[-1] - fusion_sorted[-2]) if num_options >= 2 else 0.0,
+            ])
+            return np.asarray(features, dtype=np.float32).reshape(1, -1)
+
+        if feature_set == "compact_v1":
+            top_pair = [0.0] * (num_options * num_options)
+            top_pair[receiver_top * num_options + fusion_top] = 1.0
+            log_receiver = UnifiedEvaluator._safe_log_probs(receiver)
+            log_fusion = UnifiedEvaluator._safe_log_probs(fusion)
+            dot = float(np.dot(receiver, fusion))
+            norm = float(np.linalg.norm(receiver) * np.linalg.norm(fusion))
+            features = []
+            features.extend(top_pair)
+            features.extend([
+                float(receiver_top == fusion_top),
+                float(receiver[receiver_top]),
+                float(fusion[fusion_top]),
+                float(receiver[receiver_top] - fusion[fusion_top]),
+                float(log_receiver[receiver_top]),
+                float(log_fusion[fusion_top]),
+                float(log_receiver[receiver_top] - log_fusion[fusion_top]),
+                UnifiedEvaluator._top1_margin(receiver),
+                UnifiedEvaluator._top1_margin(fusion),
+                UnifiedEvaluator._top1_margin(receiver) - UnifiedEvaluator._top1_margin(fusion),
+                UnifiedEvaluator._option_entropy(receiver),
+                UnifiedEvaluator._option_entropy(fusion),
+                UnifiedEvaluator._option_entropy(fusion) - UnifiedEvaluator._option_entropy(receiver),
+                float(receiver[fusion_top]),
+                float(fusion[receiver_top]),
+                float(receiver[receiver_top] - receiver[fusion_top]),
+                float(fusion[fusion_top] - fusion[receiver_top]),
+                UnifiedEvaluator._kl_divergence(receiver, fusion),
+                UnifiedEvaluator._kl_divergence(fusion, receiver),
+                UnifiedEvaluator._js_divergence(receiver, fusion),
+                float(np.abs(receiver - fusion).sum()),
+                float(np.linalg.norm(receiver - fusion)),
+                dot,
+                dot / norm if norm > 0.0 else 0.0,
+                float(receiver_sorted[-1] - receiver_sorted[-2]) if num_options >= 2 else 0.0,
+                float(fusion_sorted[-1] - fusion_sorted[-2]) if num_options >= 2 else 0.0,
+            ])
+            return np.asarray(features, dtype=np.float32).reshape(1, -1)
+
+        if feature_set != "logpair_v1":
+            raise ValueError(f"Unknown correctness detector feature_set: {feature_set}")
+
+        log_receiver = UnifiedEvaluator._safe_log_probs(receiver)
+        log_fusion = UnifiedEvaluator._safe_log_probs(fusion)
+        top_pair = [0.0] * (num_options * num_options)
+        top_pair[receiver_top * num_options + fusion_top] = 1.0
+        dot = float(np.dot(receiver, fusion))
+        norm = float(np.linalg.norm(receiver) * np.linalg.norm(fusion))
+
+        features = []
+        features.extend(receiver.tolist())
+        features.extend(fusion.tolist())
+        features.extend((receiver - fusion).tolist())
+        features.extend(np.abs(receiver - fusion).tolist())
+        features.extend(log_receiver.tolist())
+        features.extend(log_fusion.tolist())
+        features.extend((log_receiver - log_fusion).tolist())
+        features.extend(np.abs(log_receiver - log_fusion).tolist())
+        features.extend(np.outer(receiver, fusion).reshape(-1).tolist())
+        features.extend(one_hot(receiver_top))
+        features.extend(one_hot(fusion_top))
+        features.extend(top_pair)
+        features.extend([
+            float(receiver[receiver_top]),
+            float(fusion[fusion_top]),
+            float(receiver[receiver_top] - fusion[fusion_top]),
+            UnifiedEvaluator._top1_margin(receiver),
+            UnifiedEvaluator._top1_margin(fusion),
+            UnifiedEvaluator._top1_margin(receiver) - UnifiedEvaluator._top1_margin(fusion),
+            UnifiedEvaluator._option_entropy(receiver),
+            UnifiedEvaluator._option_entropy(fusion),
+            UnifiedEvaluator._option_entropy(fusion) - UnifiedEvaluator._option_entropy(receiver),
+            float(receiver_top == fusion_top),
+            float(receiver[fusion_top]),
+            float(fusion[receiver_top]),
+            float(receiver[receiver_top] - receiver[fusion_top]),
+            float(fusion[fusion_top] - fusion[receiver_top]),
+            UnifiedEvaluator._kl_divergence(receiver, fusion),
+            UnifiedEvaluator._kl_divergence(fusion, receiver),
+            UnifiedEvaluator._js_divergence(receiver, fusion),
+            float(np.abs(receiver - fusion).sum()),
+            float(np.linalg.norm(receiver - fusion)),
+            dot,
+            dot / norm if norm > 0.0 else 0.0,
+            float(receiver_sorted[-1] - receiver_sorted[-2]) if num_options >= 2 else 0.0,
+            float(fusion_sorted[-1] - fusion_sorted[-2]) if num_options >= 2 else 0.0,
+        ])
+        return np.asarray(features, dtype=np.float32).reshape(1, -1)
+
+    def _load_correctness_detector(self):
+        if self._correctness_detector is not None:
+            return self._correctness_detector, self._correctness_detector_config
+
+        config_path = self.eval_config.get("correctness_detector_config")
+        model_path = self.eval_config.get("correctness_detector_model_path")
+        threshold = self.eval_config.get("correctness_detector_threshold")
+        detector_config: Dict[str, Any] = {}
+
+        if config_path:
+            config_path = Path(config_path)
+            if not config_path.is_absolute():
+                config_path = Path.cwd() / config_path
+            with config_path.open() as f:
+                detector_config = json.load(f)
+            model_path = model_path or detector_config.get("model_path")
+            threshold = threshold if threshold is not None else detector_config.get("threshold")
+
+        if not model_path:
+            raise ValueError(
+                "answer_method=fusion_receiver_correctness_detector requires "
+                "correctness_detector_config or correctness_detector_model_path"
+            )
+        if threshold is None:
+            raise ValueError(
+                "answer_method=fusion_receiver_correctness_detector requires "
+                "correctness_detector_threshold or threshold in detector config"
+            )
+
+        model_path = Path(model_path)
+        if not model_path.is_absolute():
+            model_path = Path.cwd() / model_path
+        detector_type = str(detector_config.get("detector_type", "sklearn"))
+        if detector_type == "torch_binary" or model_path.suffix == ".pt":
+            checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+            detector = _TorchCorrectnessDetectorWrapper(checkpoint)
+            detector_config["detector_type"] = "torch_binary"
+        else:
+            detector = joblib.load(model_path)
+        detector_config.update({
+            "model_path": str(model_path),
+            "threshold": float(threshold),
+        })
+        self._correctness_detector = detector
+        self._correctness_detector_config = detector_config
+        return detector, detector_config
+
+    def _fusion_receiver_correctness_detector_select(
+        self,
+        *,
+        prompt: str,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        tokenizer,
+        device: torch.device,
+        model_type: str,
+        llm_tokenizer: Optional[Any],
+        proportion: float,
+        order_mode: str,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        if not isinstance(model, RosettaModel):
+            raise ValueError(
+                "answer_method=fusion_receiver_correctness_detector currently requires RosettaModel."
+            )
+
+        detector, detector_config = self._load_correctness_detector()
+        threshold = float(detector_config["threshold"])
+
+        logits_prepared = self.prepare_model_inputs(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            device=device,
+            model_type=model_type,
+            llm_tokenizer=llm_tokenizer,
+            answer_method="logits",
+            proportion=proportion,
+            order_mode=order_mode,
+        )
+        source_scores = self._score_receiver_fusion_option_logits(
+            prepared=logits_prepared,
+            model=model,
+            option_ids=option_ids,
+        )
+        receiver_probs = np.asarray(source_scores["receiver_probs"], dtype=float)
+        fusion_probs = np.asarray(source_scores["fusion_probs"], dtype=float)
+        feature_set = str(detector_config.get("feature_set", "basic38"))
+        features = self._correctness_feature_from_probs(
+            receiver_probs,
+            fusion_probs,
+            feature_set=feature_set,
+        )
+        receiver_win_prob = float(detector.predict_proba(features)[0, 1])
+
+        receiver_idx = int(receiver_probs.argmax())
+        fusion_idx = int(fusion_probs.argmax())
+        receiver_logits_pred = chr(65 + receiver_idx)
+        fusion_logits_pred = chr(65 + fusion_idx)
+        receiver_score = float(receiver_probs[receiver_idx])
+        fusion_score = float(fusion_probs[fusion_idx])
+
+        selected_source = "receiver" if receiver_win_prob >= threshold else "fusion"
+        selector_reason = (
+            "receiver_correctness_detector"
+            if selected_source == "receiver"
+            else "fusion_correctness_detector"
+        )
+
+        gen_kwargs = self._generation_kwargs(tokenizer)
+        if selected_source == "receiver":
+            receiver_inputs = self._first_model_inputs(prepared["inputs"])
+            receiver_model = model.model_list[model.base_model_idx]
+            outputs = receiver_model.generate(**receiver_inputs, **gen_kwargs)
+            input_length = receiver_inputs["input_ids"].shape[1]
+        else:
+            outputs = model.generate(**prepared["inputs"], **gen_kwargs)
+            if isinstance(prepared["inputs"]["input_ids"], list):
+                input_length = prepared["inputs"]["input_ids"][0].shape[1]
+            else:
+                input_length = prepared["inputs"]["input_ids"].shape[1]
+
+        generated_ids = outputs[0, input_length:]
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip("\n")
+        pred = self.extract_predicted_answer(text)
+        selected_probs = receiver_probs if selected_source == "receiver" else fusion_probs
+
+        return {
+            "content": text,
+            "pred": pred,
+            "input_length": int(input_length),
+            "gen_length": int(generated_ids.shape[0]),
+            "probs": selected_probs,
+            "selected_source": selected_source,
+            "selector_reason": selector_reason,
+            "receiver_text": None,
+            "fusion_text": None,
+            "receiver_pred": receiver_logits_pred,
+            "fusion_pred": fusion_logits_pred,
+            "receiver_score": receiver_score,
+            "fusion_score": fusion_score,
+            "correctness_detector_probability": receiver_win_prob,
+            "correctness_detector_threshold": threshold,
+        }
+
+    def _dual_logits_select(
+        self,
+        *,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        if not isinstance(model, RosettaModel):
+            raise ValueError("answer_method=dual_logits_select currently requires RosettaModel.")
+
+        source_scores = self._score_receiver_fusion_option_logits(
+            prepared=prepared,
+            model=model,
+            option_ids=option_ids,
+        )
+        receiver_probs = np.asarray(source_scores["receiver_probs"], dtype=float)
+        fusion_probs = np.asarray(source_scores["fusion_probs"], dtype=float)
+        receiver_logits = np.asarray(source_scores["receiver_option_logits"], dtype=float)
+        fusion_logits = np.asarray(source_scores["fusion_option_logits"], dtype=float)
+
+        receiver_idx = int(receiver_probs.argmax())
+        fusion_idx = int(fusion_probs.argmax())
+        receiver_pred = chr(65 + receiver_idx)
+        fusion_pred = chr(65 + fusion_idx)
+
+        selector = self.eval_config.get("dual_logits_selector", "top1_confidence")
+        if selector == "top1_confidence":
+            receiver_score = float(receiver_probs[receiver_idx])
+            fusion_score = float(fusion_probs[fusion_idx])
+        elif selector == "top1_logit":
+            receiver_score = float(receiver_logits[receiver_idx])
+            fusion_score = float(fusion_logits[fusion_idx])
+        elif selector == "top1_margin":
+            receiver_score = self._top1_margin(receiver_probs)
+            fusion_score = self._top1_margin(fusion_probs)
+        elif selector == "negative_entropy":
+            receiver_score = -self._option_entropy(receiver_probs)
+            fusion_score = -self._option_entropy(fusion_probs)
+        else:
+            raise ValueError(
+                "dual_logits_selector must be one of "
+                "['top1_confidence', 'top1_logit', 'top1_margin', 'negative_entropy'], "
+                f"got {selector!r}"
+            )
+
+        same_source = self.eval_config.get("dual_logits_same_answer_source", "fusion")
+        if same_source not in {"fusion", "receiver"}:
+            raise ValueError("dual_logits_same_answer_source must be 'fusion' or 'receiver'")
+
+        margin = float(self.eval_config.get("dual_logits_margin", 0.0))
+        if receiver_pred == fusion_pred:
+            selected_source = same_source
+            selector_reason = "same_top1"
+        elif receiver_score > fusion_score + margin:
+            selected_source = "receiver"
+            selector_reason = f"receiver_{selector}"
+        else:
+            selected_source = "fusion"
+            selector_reason = f"fusion_{selector}"
+
+        if selected_source == "receiver":
+            selected_pred = receiver_pred
+            probs = receiver_probs
+        else:
+            selected_pred = fusion_pred
+            probs = fusion_probs
+
+        return {
+            "content": f"The correct answer is {selected_pred}",
+            "pred": selected_pred,
+            "input_length": None,
+            "gen_length": None,
+            "probs": probs,
+            "receiver_probs": json.dumps(receiver_probs.tolist()),
+            "fusion_probs": json.dumps(fusion_probs.tolist()),
+            "selected_source": selected_source,
+            "selector_reason": selector_reason,
+            "receiver_text": f"The correct answer is {receiver_pred}",
+            "fusion_text": f"The correct answer is {fusion_pred}",
+            "receiver_pred": receiver_pred,
+            "fusion_pred": fusion_pred,
+            "receiver_score": receiver_score,
+            "fusion_score": fusion_score,
+        }
+
+    def _fusion_logits_fallback_select(
+        self,
+        *,
+        prompt: str,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        tokenizer,
+        device: torch.device,
+        model_type: str,
+        llm_tokenizer: Optional[Any],
+        proportion: float,
+        order_mode: str,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        if not isinstance(model, RosettaModel):
+            raise ValueError(
+                "answer_method=fusion_logits_fallback currently requires RosettaModel."
+            )
+
+        gen_kwargs = self._generation_kwargs(tokenizer)
+        fusion_outputs = model.generate(**prepared["inputs"], **gen_kwargs)
+        if isinstance(prepared["inputs"]["input_ids"], list):
+            fusion_input_len = prepared["inputs"]["input_ids"][0].shape[1]
+        else:
+            fusion_input_len = prepared["inputs"]["input_ids"].shape[1]
+        fusion_generated_ids = fusion_outputs[0, fusion_input_len:]
+        fusion_text = tokenizer.decode(
+            fusion_generated_ids,
+            skip_special_tokens=True,
+        ).strip("\n")
+        fusion_generated_pred = self.extract_predicted_answer(fusion_text)
+
+        logits_prepared = self.prepare_model_inputs(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            device=device,
+            model_type=model_type,
+            llm_tokenizer=llm_tokenizer,
+            answer_method="logits",
+            proportion=proportion,
+            order_mode=order_mode,
+        )
+        source_scores = self._score_receiver_fusion_option_logits(
+            prepared=logits_prepared,
+            model=model,
+            option_ids=option_ids,
+        )
+        receiver_probs = np.asarray(source_scores["receiver_probs"], dtype=float)
+        fusion_probs = np.asarray(source_scores["fusion_probs"], dtype=float)
+        receiver_logits = np.asarray(source_scores["receiver_option_logits"], dtype=float)
+        fusion_logits = np.asarray(source_scores["fusion_option_logits"], dtype=float)
+
+        receiver_idx = int(receiver_probs.argmax())
+        fusion_idx = int(fusion_probs.argmax())
+        receiver_logits_pred = chr(65 + receiver_idx)
+        fusion_logits_pred = chr(65 + fusion_idx)
+
+        selector = self.eval_config.get("fusion_logits_selector", "top1_confidence")
+        if selector == "top1_confidence":
+            receiver_score = float(receiver_probs[receiver_idx])
+            fusion_score = float(fusion_probs[fusion_idx])
+        elif selector == "top1_logit":
+            receiver_score = float(receiver_logits[receiver_idx])
+            fusion_score = float(fusion_logits[fusion_idx])
+        elif selector == "top1_margin":
+            receiver_score = self._top1_margin(receiver_probs)
+            fusion_score = self._top1_margin(fusion_probs)
+        elif selector == "negative_entropy":
+            receiver_score = -self._option_entropy(receiver_probs)
+            fusion_score = -self._option_entropy(fusion_probs)
+        else:
+            raise ValueError(
+                "fusion_logits_selector must be one of "
+                "['top1_confidence', 'top1_logit', 'top1_margin', 'negative_entropy'], "
+                f"got {selector!r}"
+            )
+
+        margin = float(self.eval_config.get("fusion_logits_margin", 0.0))
+        should_fallback = (
+            receiver_logits_pred != fusion_logits_pred
+            and receiver_score > fusion_score + margin
+        )
+
+        selected_source = "fusion"
+        selector_reason = (
+            "same_top1"
+            if receiver_logits_pred == fusion_logits_pred
+            else f"fusion_{selector}"
+        )
+        receiver_text = None
+        receiver_generated_pred = None
+        receiver_generated_ids = None
+
+        if should_fallback:
+            receiver_inputs = self._first_model_inputs(prepared["inputs"])
+            receiver_model = model.model_list[model.base_model_idx]
+            receiver_outputs = receiver_model.generate(**receiver_inputs, **gen_kwargs)
+            receiver_input_len = receiver_inputs["input_ids"].shape[1]
+            receiver_generated_ids = receiver_outputs[0, receiver_input_len:]
+            receiver_text = tokenizer.decode(
+                receiver_generated_ids,
+                skip_special_tokens=True,
+            ).strip("\n")
+            receiver_generated_pred = self.extract_predicted_answer(receiver_text)
+            selected_source = "receiver"
+            selector_reason = f"receiver_{selector}"
+
+        if selected_source == "receiver":
+            selected_text = receiver_text or ""
+            selected_pred = receiver_generated_pred
+            selected_gen_len = int(receiver_generated_ids.shape[0]) if receiver_generated_ids is not None else 0
+            probs = receiver_probs
+        else:
+            selected_text = fusion_text
+            selected_pred = fusion_generated_pred
+            selected_gen_len = int(fusion_generated_ids.shape[0])
+            probs = fusion_probs
+
+        return {
+            "content": selected_text,
+            "pred": selected_pred,
+            "input_length": int(fusion_input_len),
+            "gen_length": selected_gen_len,
+            "probs": probs,
+            "selected_source": selected_source,
+            "selector_reason": selector_reason,
+            "receiver_text": receiver_text,
+            "fusion_text": fusion_text,
+            "receiver_pred": receiver_logits_pred,
+            "fusion_pred": fusion_logits_pred,
+            "receiver_score": receiver_score,
+            "fusion_score": fusion_score,
+        }
+
+    def _dual_generate_select(
+        self,
+        *,
+        prompt: str,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        tokenizer,
+        device: torch.device,
+        model_type: str,
+        llm_tokenizer: Optional[Any],
+        proportion: float,
+        order_mode: str,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        if not isinstance(model, RosettaModel):
+            raise ValueError("answer_method=dual_generate currently requires RosettaModel.")
+
+        gen_kwargs = self._generation_kwargs(tokenizer)
+        receiver_inputs = self._first_model_inputs(prepared["inputs"])
+        receiver_model = model.model_list[model.base_model_idx]
+        receiver_outputs = receiver_model.generate(**receiver_inputs, **gen_kwargs)
+        receiver_input_len = receiver_inputs["input_ids"].shape[1]
+        receiver_generated_ids = receiver_outputs[0, receiver_input_len:]
+        receiver_text = tokenizer.decode(
+            receiver_generated_ids,
+            skip_special_tokens=True,
+        ).strip("\n")
+        receiver_pred = self.extract_predicted_answer(receiver_text)
+
+        fusion_outputs = model.generate(**prepared["inputs"], **gen_kwargs)
+        if isinstance(prepared["inputs"]["input_ids"], list):
+            fusion_input_len = prepared["inputs"]["input_ids"][0].shape[1]
+        else:
+            fusion_input_len = prepared["inputs"]["input_ids"].shape[1]
+        fusion_generated_ids = fusion_outputs[0, fusion_input_len:]
+        fusion_text = tokenizer.decode(
+            fusion_generated_ids,
+            skip_special_tokens=True,
+        ).strip("\n")
+        fusion_pred = self.extract_predicted_answer(fusion_text)
+
+        selected_source = "fusion"
+        selector_reason = "default_fusion"
+        selector_scores = {
+            "receiver_score": None,
+            "fusion_score": None,
+            "receiver_probs": np.array([0.25] * len(option_ids)),
+            "fusion_probs": np.array([0.25] * len(option_ids)),
+        }
+
+        receiver_valid = self._choice_index(receiver_pred, len(option_ids)) is not None
+        fusion_valid = self._choice_index(fusion_pred, len(option_ids)) is not None
+        if receiver_valid and not fusion_valid:
+            selected_source = "receiver"
+            selector_reason = "receiver_only_valid"
+        elif fusion_valid and not receiver_valid:
+            selected_source = "fusion"
+            selector_reason = "fusion_only_valid"
+        elif receiver_valid and fusion_valid and receiver_pred == fusion_pred:
+            selected_source = "fusion"
+            selector_reason = "same_answer"
+        elif receiver_valid and fusion_valid:
+            selector_scores = self._score_dual_generate_candidates(
+                prompt=prompt,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                model_type=model_type,
+                llm_tokenizer=llm_tokenizer,
+                proportion=proportion,
+                order_mode=order_mode,
+                option_ids=option_ids,
+                receiver_pred=receiver_pred,
+                fusion_pred=fusion_pred,
+            )
+            selector = self.eval_config.get(
+                "dual_generate_selector",
+                "source_confidence",
+            )
+            margin = float(self.eval_config.get("dual_generate_margin", 0.0))
+            receiver_idx = self._choice_index(receiver_pred, len(option_ids))
+            fusion_idx = self._choice_index(fusion_pred, len(option_ids))
+            receiver_probs = np.asarray(selector_scores["receiver_probs"], dtype=float)
+            fusion_probs = np.asarray(selector_scores["fusion_probs"], dtype=float)
+            eps = 1e-12
+            if selector == "source_confidence":
+                receiver_score = float(selector_scores["receiver_score"])
+                fusion_score = float(selector_scores["fusion_score"])
+            elif selector == "source_entropy":
+                # Lower entropy means higher confidence, so negate it to keep
+                # the common "larger score wins" selection rule.
+                receiver_score = -self._option_entropy(receiver_probs)
+                fusion_score = -self._option_entropy(fusion_probs)
+            elif selector == "source_top1_margin":
+                receiver_score = self._top1_margin(receiver_probs)
+                fusion_score = self._top1_margin(fusion_probs)
+            elif selector == "fusion_verifier":
+                receiver_score = float(fusion_probs[receiver_idx])
+                fusion_score = float(fusion_probs[fusion_idx])
+            elif selector == "receiver_verifier":
+                receiver_score = float(receiver_probs[receiver_idx])
+                fusion_score = float(receiver_probs[fusion_idx])
+            elif selector == "ensemble_verifier":
+                receiver_score = 0.5 * (
+                    float(np.log(receiver_probs[receiver_idx] + eps))
+                    + float(np.log(fusion_probs[receiver_idx] + eps))
+                )
+                fusion_score = 0.5 * (
+                    float(np.log(receiver_probs[fusion_idx] + eps))
+                    + float(np.log(fusion_probs[fusion_idx] + eps))
+                )
+            else:
+                raise ValueError(
+                    "dual_generate_selector must be one of "
+                    "['source_confidence', 'source_entropy', "
+                    "'source_top1_margin', 'fusion_verifier', "
+                    "'receiver_verifier', 'ensemble_verifier'], "
+                    f"got {selector}"
+                )
+            selector_scores["receiver_score"] = receiver_score
+            selector_scores["fusion_score"] = fusion_score
+            receiver_allowed = self._receiver_output_passes_dual_guard(receiver_text)
+            if receiver_score > fusion_score + margin and receiver_allowed:
+                selected_source = "receiver"
+                selector_reason = f"receiver_{selector}"
+            else:
+                selected_source = "fusion"
+                selector_reason = (
+                    f"fusion_{selector}"
+                    if receiver_allowed
+                    else f"fusion_{selector}_receiver_guarded"
+                )
+
+        if selected_source == "receiver":
+            selected_text = receiver_text
+            selected_pred = receiver_pred
+            selected_gen_len = int(receiver_generated_ids.shape[0])
+            probs = np.asarray(selector_scores["receiver_probs"], dtype=float)
+        else:
+            selected_text = fusion_text
+            selected_pred = fusion_pred
+            selected_gen_len = int(fusion_generated_ids.shape[0])
+            probs = np.asarray(selector_scores["fusion_probs"], dtype=float)
+
+        return {
+            "content": selected_text,
+            "pred": selected_pred,
+            "input_length": int(fusion_input_len),
+            "gen_length": selected_gen_len,
+            "probs": probs,
+            "selected_source": selected_source,
+            "selector_reason": selector_reason,
+            "receiver_text": receiver_text,
+            "fusion_text": fusion_text,
+            "receiver_pred": receiver_pred,
+            "fusion_pred": fusion_pred,
+            "receiver_score": selector_scores["receiver_score"],
+            "fusion_score": selector_scores["fusion_score"],
+        }
+
+    def _fusion_confidence_fallback_select(
+        self,
+        *,
+        prepared: Dict[str, Any],
+        model: RosettaModel,
+        tokenizer,
+        option_ids: List[int],
+    ) -> Dict[str, Any]:
+        if not isinstance(model, RosettaModel):
+            raise ValueError(
+                "answer_method=fusion_confidence_fallback currently requires RosettaModel."
+            )
+
+        threshold = float(self.eval_config.get("fusion_fallback_threshold", 0.06))
+        gen_kwargs = self._generation_kwargs(tokenizer)
+        fusion_gen_kwargs = dict(gen_kwargs)
+        fusion_gen_kwargs["return_dict_in_generate"] = True
+        fusion_gen_kwargs["output_scores"] = True
+
+        fusion_outputs = model.generate(**prepared["inputs"], **fusion_gen_kwargs)
+        fusion_sequences = self._generate_sequences(fusion_outputs)
+        fusion_scores = self._generate_scores(fusion_outputs)
+        if isinstance(prepared["inputs"]["input_ids"], list):
+            fusion_input_len = prepared["inputs"]["input_ids"][0].shape[1]
+        else:
+            fusion_input_len = prepared["inputs"]["input_ids"].shape[1]
+        fusion_generated_ids = fusion_sequences[0, fusion_input_len:]
+        fusion_text = tokenizer.decode(
+            fusion_generated_ids,
+            skip_special_tokens=True,
+        ).strip("\n")
+        fusion_pred = self.extract_predicted_answer(fusion_text)
+        confidence_info = self._generated_answer_token_confidence(
+            generated_ids=fusion_generated_ids,
+            scores=fusion_scores,
+            pred=fusion_pred,
+            option_ids=option_ids,
+            tokenizer=tokenizer,
+        )
+        fusion_confidence = confidence_info["confidence"]
+        fusion_valid = self._choice_index(fusion_pred, len(option_ids)) is not None
+        should_fallback = (
+            (not fusion_valid)
+            or fusion_confidence is None
+            or fusion_confidence < threshold
+        )
+
+        selected_source = "fusion"
+        selector_reason = "fusion_confidence_ok"
+        receiver_text = None
+        receiver_pred = None
+        receiver_generated_ids = None
+
+        if should_fallback:
+            receiver_inputs = self._first_model_inputs(prepared["inputs"])
+            receiver_model = model.model_list[model.base_model_idx]
+            receiver_outputs = receiver_model.generate(**receiver_inputs, **gen_kwargs)
+            receiver_sequences = self._generate_sequences(receiver_outputs)
+            receiver_input_len = receiver_inputs["input_ids"].shape[1]
+            receiver_generated_ids = receiver_sequences[0, receiver_input_len:]
+            receiver_text = tokenizer.decode(
+                receiver_generated_ids,
+                skip_special_tokens=True,
+            ).strip("\n")
+            receiver_pred = self.extract_predicted_answer(receiver_text)
+            receiver_valid = self._choice_index(receiver_pred, len(option_ids)) is not None
+            if receiver_valid or not fusion_valid:
+                selected_source = "receiver"
+                selector_reason = (
+                    "receiver_fusion_invalid"
+                    if not fusion_valid
+                    else "receiver_low_fusion_confidence"
+                )
+            else:
+                selected_source = "fusion"
+                selector_reason = "fusion_receiver_invalid"
+
+        if selected_source == "receiver":
+            selected_text = receiver_text or ""
+            selected_pred = receiver_pred
+            selected_gen_len = int(receiver_generated_ids.shape[0]) if receiver_generated_ids is not None else 0
+        else:
+            selected_text = fusion_text
+            selected_pred = fusion_pred
+            selected_gen_len = int(fusion_generated_ids.shape[0])
+
+        return {
+            "content": selected_text,
+            "pred": selected_pred,
+            "input_length": int(fusion_input_len),
+            "gen_length": selected_gen_len,
+            "probs": np.array([0.25] * len(option_ids)),
+            "selected_source": selected_source,
+            "selector_reason": selector_reason,
+            "threshold": threshold,
+            "fusion_confidence": fusion_confidence,
+            "fusion_answer_token_position": confidence_info["token_position"],
+            "fusion_answer_token_id": confidence_info["token_id"],
+            "receiver_text": receiver_text,
+            "fusion_text": fusion_text,
+            "receiver_pred": receiver_pred,
+            "fusion_pred": fusion_pred,
+        }
+
     def create_segmented_kv_cache_index(self, instruction_length: int, response_length: int, 
                                        proportion: float, order_mode: str, device: torch.device) -> List[torch.Tensor]:
         """
@@ -848,7 +2085,7 @@ class UnifiedEvaluator:
 
         # Build chat-formatted text
         if not use_aligner:
-            if answer_method == 'logits':
+            if self._is_logits_answer_method(answer_method):
                 text = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
@@ -909,7 +2146,7 @@ class UnifiedEvaluator:
                 strategy=AlignmentStrategy(alignment_strategy)
             )
 
-            if answer_method == 'logits':
+            if self._is_logits_answer_method(answer_method):
                 # Use custom response text if provided, otherwise default
                 response_text = self.eval_config.get("response_text", "The correct answer is")
                 messages.append({"role": "assistant", "content": response_text})
@@ -1027,6 +2264,8 @@ class UnifiedEvaluator:
             dataset = load_dataset(self.dataset_config["dataset_name"])
         elif self.dataset_name == "ceval":
             dataset = load_dataset(self.dataset_config["dataset_name"], subject)
+        elif self.dataset_name == "mmlu-auxiliary":
+            dataset = load_dataset(self.dataset_config["dataset_name"], subject)
         else:
             dataset = load_dataset(self.dataset_config["dataset_name"], subject)
         # dataset = load_from_disk("local/teacher_datasets/MMMLU")
@@ -1082,6 +2321,25 @@ class UnifiedEvaluator:
         # Sampling configuration
         sample_interval = self.eval_config.get("sample_interval", 1)
         sample_indices = list(range(0, len(test_data), sample_interval))
+        sample_shuffle_seed = self.eval_config.get("sample_shuffle_seed")
+        if sample_shuffle_seed is not None:
+            rng = random.Random(int(sample_shuffle_seed))
+            rng.shuffle(sample_indices)
+        max_samples = self.eval_config.get("max_samples")
+        if max_samples is not None:
+            max_samples = int(max_samples)
+            if max_samples > 0:
+                sample_indices = sample_indices[:max_samples]
+
+        # Optional slice after interval/shuffle/max_samples. This is useful for
+        # long single-subject datasets where we want resumable chunked runs with
+        # the same shuffled sample order as the full run.
+        sample_start = self.eval_config.get("sample_start")
+        sample_end = self.eval_config.get("sample_end")
+        if sample_start is not None or sample_end is not None:
+            start = 0 if sample_start is None else int(sample_start)
+            end = len(sample_indices) if sample_end is None else int(sample_end)
+            sample_indices = sample_indices[start:end]
 
         # Apply virtual split window for datasets without native subjects
         if is_virtual_split and total_splits > 1:
@@ -1103,6 +2361,10 @@ class UnifiedEvaluator:
         for i in tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})"):
             try:
                 example = test_data[i]
+                entropy_gate_metrics = self._empty_entropy_gate_metrics()
+                router_metrics = self._empty_router_metrics()
+                router_stats_before = self._snapshot_router_stats(model)
+                dual_generate_info = {}
                 
                 if self.dataset_name != "longbench":
                     true_answer = self.parse_answer(example)
@@ -1120,7 +2382,7 @@ class UnifiedEvaluator:
                 # Format prompt (pass subject for locale-aware templates)
                 if self.dataset_name == "mmmlu":
                     prompt = self._format_mmmlu_example(example, use_cot=self.eval_config["use_cot"], subject=subject, use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "mmlu-redux":
+                elif self.dataset_name in ["mmlu-redux", "mmlu-auxiliary"]:
                     prompt = self._format_mmlu_redux_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
                 elif self.dataset_name == "gpqa":
                     prompt = self._format_gpqa_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
@@ -1145,7 +2407,7 @@ class UnifiedEvaluator:
                     # Extract question without options
                     if self.dataset_name == "mmmlu":
                         question_text = example.get('Question', '')
-                    elif self.dataset_name == "mmlu-redux":
+                    elif self.dataset_name in ["mmlu-redux", "mmlu-auxiliary"]:
                         question_text = example.get('question', '')
                     elif self.dataset_name == "gpqa":
                         question_text = self._prepare_gpqa_item(example)['question']
@@ -1230,6 +2492,7 @@ class UnifiedEvaluator:
                     # Get proportion and order_mode from config, with defaults
                     proportion = self.eval_config.get("kv_cache_proportion", 1.0)
                     order_mode = self.eval_config.get("kv_cache_order_mode", "front")
+                    entropy_gate_metrics = self._empty_entropy_gate_metrics()
                     
                     prepared = self.prepare_model_inputs(
                         prompt=prompt,
@@ -1247,6 +2510,8 @@ class UnifiedEvaluator:
                         def _forward_call():
                             return model.forward(**prepared['inputs'])
                         outputs, latency_ms = self._measure_latency_ms(_forward_call, device)
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
 
                         logits = outputs.logits[0, -1]
                         option_logits = torch.tensor([
@@ -1258,14 +2523,163 @@ class UnifiedEvaluator:
                         # No CoT generation in logits mode
                         input_length, gen_length = None, None
                         cot_pred, cot_input_len, cot_gen_len, cot_text = None, None, None, None
+                    elif self.eval_config["answer_method"] == "dual_generate":
+                        def _dual_generate_call():
+                            return self._dual_generate_select(
+                                prompt=prompt,
+                                prepared=prepared,
+                                model=model,
+                                tokenizer=tokenizer,
+                                device=device,
+                                model_type=model_type,
+                                llm_tokenizer=llm_tokenizer,
+                                proportion=proportion,
+                                order_mode=order_mode,
+                                option_ids=option_ids,
+                            )
+
+                        dual_result, latency_ms = self._measure_latency_ms(
+                            _dual_generate_call,
+                            device,
+                        )
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
+
+                        content = dual_result["content"]
+                        pred = dual_result["pred"]
+                        probs = dual_result["probs"]
+                        input_length = dual_result["input_length"]
+                        gen_length = dual_result["gen_length"]
+                        cot_text = content
+                        cot_pred = pred
+                        cot_input_len, cot_gen_len = input_length, gen_length
+                        dual_generate_info = dual_result
+                        math_eval = None
+                    elif self.eval_config["answer_method"] == "dual_logits_select":
+                        def _dual_logits_select_call():
+                            return self._dual_logits_select(
+                                prepared=prepared,
+                                model=model,
+                                option_ids=option_ids,
+                            )
+
+                        dual_logits_result, latency_ms = self._measure_latency_ms(
+                            _dual_logits_select_call,
+                            device,
+                        )
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
+
+                        content = dual_logits_result["content"]
+                        pred = dual_logits_result["pred"]
+                        probs = dual_logits_result["probs"]
+                        input_length = dual_logits_result["input_length"]
+                        gen_length = dual_logits_result["gen_length"]
+                        cot_text = content
+                        cot_pred = pred
+                        cot_input_len, cot_gen_len = input_length, gen_length
+                        dual_generate_info = dual_logits_result
+                        math_eval = None
+                    elif self.eval_config["answer_method"] == "fusion_logits_fallback":
+                        def _fusion_logits_fallback_call():
+                            return self._fusion_logits_fallback_select(
+                                prompt=prompt,
+                                prepared=prepared,
+                                model=model,
+                                tokenizer=tokenizer,
+                                device=device,
+                                model_type=model_type,
+                                llm_tokenizer=llm_tokenizer,
+                                proportion=proportion,
+                                order_mode=order_mode,
+                                option_ids=option_ids,
+                            )
+
+                        fusion_logits_result, latency_ms = self._measure_latency_ms(
+                            _fusion_logits_fallback_call,
+                            device,
+                        )
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
+
+                        content = fusion_logits_result["content"]
+                        pred = fusion_logits_result["pred"]
+                        probs = fusion_logits_result["probs"]
+                        input_length = fusion_logits_result["input_length"]
+                        gen_length = fusion_logits_result["gen_length"]
+                        cot_text = content
+                        cot_pred = pred
+                        cot_input_len, cot_gen_len = input_length, gen_length
+                        dual_generate_info = fusion_logits_result
+                        math_eval = None
+                    elif self.eval_config["answer_method"] == "fusion_receiver_correctness_detector":
+                        def _correctness_detector_call():
+                            return self._fusion_receiver_correctness_detector_select(
+                                prompt=prompt,
+                                prepared=prepared,
+                                model=model,
+                                tokenizer=tokenizer,
+                                device=device,
+                                model_type=model_type,
+                                llm_tokenizer=llm_tokenizer,
+                                proportion=proportion,
+                                order_mode=order_mode,
+                                option_ids=option_ids,
+                            )
+
+                        detector_result, latency_ms = self._measure_latency_ms(
+                            _correctness_detector_call,
+                            device,
+                        )
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
+
+                        content = detector_result["content"]
+                        pred = detector_result["pred"]
+                        probs = detector_result["probs"]
+                        input_length = detector_result["input_length"]
+                        gen_length = detector_result["gen_length"]
+                        cot_text = content
+                        cot_pred = pred
+                        cot_input_len, cot_gen_len = input_length, gen_length
+                        dual_generate_info = detector_result
+                        math_eval = None
+                    elif self.eval_config["answer_method"] == "fusion_confidence_fallback":
+                        def _fusion_confidence_fallback_call():
+                            return self._fusion_confidence_fallback_select(
+                                prepared=prepared,
+                                model=model,
+                                tokenizer=tokenizer,
+                                option_ids=option_ids,
+                            )
+
+                        fallback_result, latency_ms = self._measure_latency_ms(
+                            _fusion_confidence_fallback_call,
+                            device,
+                        )
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
+
+                        content = fallback_result["content"]
+                        pred = fallback_result["pred"]
+                        probs = fallback_result["probs"]
+                        input_length = fallback_result["input_length"]
+                        gen_length = fallback_result["gen_length"]
+                        cot_text = content
+                        cot_pred = pred
+                        cot_input_len, cot_gen_len = input_length, gen_length
+                        dual_generate_info = fallback_result
+                        math_eval = None
                     elif self.eval_config["answer_method"] == "generate":  # generate
                         # Ensure model has uniform generation config applied
                         #apply_generation_config(model, self.generation_config)
 
                         inputs = prepared['inputs']
                         def _generate_call():
-                            return model.generate(**inputs, **self.generation_config)
+                            return model.generate(**inputs, **self._generation_kwargs(tokenizer))
                         outputs, latency_ms = self._measure_latency_ms(_generate_call, device)
+                        entropy_gate_metrics = self._extract_entropy_gate_metrics(model)
+                        router_metrics = self._extract_router_metrics(model, router_stats_before)
                         
                         if isinstance(model, RosettaModel):
                             generated_ids = outputs[0]
@@ -1313,7 +2727,7 @@ class UnifiedEvaluator:
                                 print("[Input with chat template]:\n" + str(text))
                         else:
                             print("[Input with chat template]:\n" + str(text))
-                        if self.eval_config["answer_method"] == 'generate' and cot_text is not None:
+                        if self.eval_config["answer_method"] in {'generate', 'dual_generate', 'dual_logits_select', 'fusion_logits_fallback', 'fusion_receiver_correctness_detector'} and cot_text is not None:
                             print("\n[Generated output]:\n" + str(cot_text))
                         print("================ End Example IO ================\n")
                     except Exception as e:
@@ -1337,7 +2751,7 @@ class UnifiedEvaluator:
                     is_correct = None
                     
                 # Collect length statistics
-                if self.eval_config["answer_method"] == 'generate' and input_length is not None and gen_length is not None:
+                if self.eval_config["answer_method"] in {'generate', 'dual_generate'} and input_length is not None and gen_length is not None:
                     length_ratio = gen_length / input_length if input_length > 0 else 0
                     length_stats.append({
                         'subject': subject,
@@ -1380,7 +2794,36 @@ class UnifiedEvaluator:
                     'cot_input_length': cot_input_len,
                     'cot_gen_length': cot_gen_len,
                     'cot_output': cot_text,
-                    'answer_latency_ms': float(latency_ms) if 'latency_ms' in locals() and latency_ms is not None else None
+                    'answer_latency_ms': float(latency_ms) if 'latency_ms' in locals() and latency_ms is not None else None,
+                    'entropy_gate_opportunity': entropy_gate_metrics.get('entropy_gate_opportunity'),
+                    'entropy_gate_checked': entropy_gate_metrics.get('entropy_gate_checked'),
+                    'entropy_gate_allowed': entropy_gate_metrics.get('entropy_gate_allowed'),
+                    'entropy_gate_blocked': entropy_gate_metrics.get('entropy_gate_blocked'),
+                    'entropy_gate_skip_rate': entropy_gate_metrics.get('entropy_gate_skip_rate'),
+                    'router_decision_count': router_metrics.get('router_decision_count'),
+                    'router_fuse_count': router_metrics.get('router_fuse_count'),
+                    'router_skip_count': router_metrics.get('router_skip_count'),
+                    'router_fuse_rate': router_metrics.get('router_fuse_rate'),
+                    'router_skip_rate': router_metrics.get('router_skip_rate'),
+                    'router_should_fuse': router_metrics.get('router_should_fuse'),
+                    'router_selected_bank': router_metrics.get('router_selected_bank'),
+                    'router_skip_probability': router_metrics.get('router_skip_probability'),
+                    'dual_selected_source': dual_generate_info.get('selected_source'),
+                    'dual_selector_reason': dual_generate_info.get('selector_reason'),
+                    'dual_receiver_pred': dual_generate_info.get('receiver_pred'),
+                    'dual_fusion_pred': dual_generate_info.get('fusion_pred'),
+                    'dual_receiver_probs': dual_generate_info.get('receiver_probs'),
+                    'dual_fusion_probs': dual_generate_info.get('fusion_probs'),
+                    'dual_receiver_score': dual_generate_info.get('receiver_score'),
+                    'dual_fusion_score': dual_generate_info.get('fusion_score'),
+                    'dual_receiver_output': dual_generate_info.get('receiver_text'),
+                    'dual_fusion_output': dual_generate_info.get('fusion_text'),
+                    'fallback_threshold': dual_generate_info.get('threshold'),
+                    'fallback_fusion_confidence': dual_generate_info.get('fusion_confidence'),
+                    'fallback_fusion_answer_token_position': dual_generate_info.get('fusion_answer_token_position'),
+                    'fallback_fusion_answer_token_id': dual_generate_info.get('fusion_answer_token_id'),
+                    'correctness_detector_probability': dual_generate_info.get('correctness_detector_probability'),
+                    'correctness_detector_threshold': dual_generate_info.get('correctness_detector_threshold'),
                 }
                 
                 # Add question and choices based on dataset format
@@ -1488,7 +2931,7 @@ class UnifiedEvaluator:
                         'C': example.get('C', ''),
                         'D': example.get('D', ''),
                     })
-                elif self.dataset_name == "mmlu-redux":  # mmlu-redux
+                elif self.dataset_name in ["mmlu-redux", "mmlu-auxiliary"]:
                     choices = example.get('choices', [])
                     cot_log_entry.update({
                         'question': example.get('question', ''),
@@ -1710,6 +3153,47 @@ class UnifiedEvaluator:
         if all_length_stats:
             length_summary = self._compute_length_statistics(all_length_stats)
             summary["length_statistics"] = length_summary
+
+        gate_rows = [
+            row for row in all_cot_logs
+            if row.get("entropy_gate_opportunity") is not None
+        ]
+        if gate_rows:
+            entropy_gate_opportunity_total = sum(int(row.get("entropy_gate_opportunity") or 0) for row in gate_rows)
+            entropy_gate_checked_total = sum(int(row.get("entropy_gate_checked") or 0) for row in gate_rows)
+            entropy_gate_allowed_total = sum(int(row.get("entropy_gate_allowed") or 0) for row in gate_rows)
+            entropy_gate_blocked_total = sum(int(row.get("entropy_gate_blocked") or 0) for row in gate_rows)
+            summary["entropy_gate_opportunity_total"] = entropy_gate_opportunity_total
+            summary["entropy_gate_checked_total"] = entropy_gate_checked_total
+            summary["entropy_gate_allowed_total"] = entropy_gate_allowed_total
+            summary["entropy_gate_blocked_total"] = entropy_gate_blocked_total
+            summary["entropy_gate_skip_rate"] = (
+                entropy_gate_blocked_total / entropy_gate_opportunity_total
+                if entropy_gate_opportunity_total > 0
+                else None
+            )
+
+        router_rows = [
+            row for row in all_cot_logs
+            if row.get("router_decision_count") is not None
+        ]
+        if router_rows:
+            router_decision_total = sum(int(row.get("router_decision_count") or 0) for row in router_rows)
+            router_fuse_total = sum(int(row.get("router_fuse_count") or 0) for row in router_rows)
+            router_skip_total = sum(int(row.get("router_skip_count") or 0) for row in router_rows)
+            summary["router_decision_total"] = router_decision_total
+            summary["router_fuse_total"] = router_fuse_total
+            summary["router_skip_total"] = router_skip_total
+            summary["router_fuse_rate"] = (
+                router_fuse_total / router_decision_total
+                if router_decision_total > 0
+                else None
+            )
+            summary["router_skip_rate"] = (
+                router_skip_total / router_decision_total
+                if router_decision_total > 0
+                else None
+            )
         
         # Generate filename
         model_name_for_file = self.model_config["model_name"].split("/")[-1]
@@ -1737,6 +3221,21 @@ class UnifiedEvaluator:
                     'true_answer', 'pred', 'is_correct', 'answer_method',
                     'cot_pred', 'cot_input_length', 'cot_gen_length', 'cot_output',
                     'answer_latency_ms',
+                    'entropy_gate_opportunity', 'entropy_gate_checked', 'entropy_gate_allowed',
+                    'entropy_gate_blocked', 'entropy_gate_skip_rate',
+                    'router_decision_count', 'router_fuse_count', 'router_skip_count',
+                    'router_fuse_rate', 'router_skip_rate', 'router_should_fuse',
+                    'router_selected_bank', 'router_skip_probability',
+                    'dual_selected_source', 'dual_selector_reason',
+                    'dual_receiver_pred', 'dual_fusion_pred',
+                    'dual_receiver_probs', 'dual_fusion_probs',
+                    'dual_receiver_score', 'dual_fusion_score',
+                    'dual_receiver_output', 'dual_fusion_output',
+                    'fallback_threshold', 'fallback_fusion_confidence',
+                    'fallback_fusion_answer_token_position',
+                    'fallback_fusion_answer_token_id',
+                    'correctness_detector_probability',
+                    'correctness_detector_threshold',
                     # Extraction diagnostics (mainly for MATH-500)
                     'extraction_method_used', 'ground_truth_normalized', 'extracted_normalized'
                 ]

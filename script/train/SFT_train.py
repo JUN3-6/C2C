@@ -357,13 +357,12 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         
         # Init RosettaModel
         K = 1
-
         rosetta_model = RosettaModel(
             model_list=[base_model, teacher_model],
             base_model_idx=0,
             projector_list=projector_list,
             include_response=model_config.get("include_response", False),
-            multi_source_fusion_mode=model_config.get("multi_source_fusion_mode", "sequential")
+            multi_source_fusion_mode=model_config.get("multi_source_fusion_mode", "sequential"),
         ).to(device).eval()
         
         
@@ -542,6 +541,10 @@ def main():
             mode=output_config["wandb_config"]["mode"],
             entity=output_config["wandb_config"]["entity"]
         )
+        wandb.define_metric("trainer/global_step")
+        wandb.define_metric("train/*", step_metric="trainer/global_step")
+        wandb.define_metric("val/*", step_metric="trainer/global_step")
+        wandb.define_metric("eval/*", step_metric="trainer/global_step")
     
     print(f"Outputs will be saved to: {timestamped_output_dir}")
 
@@ -785,6 +788,7 @@ def main():
     # ------------------------------------------------------------------
     print("Starting training…")
     global_step = 0
+    best_eval_loss = float("inf")
     optimizer.zero_grad()
     for epoch in range(training_config["num_epochs"]):
         if distributed and train_sampler is not None:
@@ -851,6 +855,7 @@ def main():
                 progress_bar.update(1)
 
                 wandb.log({
+                    "trainer/global_step": global_step,
                     "train/loss": avg_window_loss,
                     "train/lr": scheduler.get_last_lr()[0],
                     "train/grad_norm": grad_norm_value,
@@ -876,19 +881,31 @@ def main():
                         dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
                         avg_eval_loss = loss_tensor.item()
                         if is_main_process:
+                            best_eval_loss = min(best_eval_loss, avg_eval_loss)
                             print(f"\nEvaluation (mid-epoch) at step {global_step}: {avg_eval_loss:.4f}")
                             wandb.log({
+                                "trainer/global_step": global_step,
                                 "eval/loss": avg_eval_loss,
+                                "val/loss": avg_eval_loss,
                                 "eval/step": global_step,
-                                "eval/epoch": fractional_epoch
+                                "val/step": global_step,
+                                "eval/epoch": fractional_epoch,
+                                "val/epoch": fractional_epoch,
+                                "val/best_loss": best_eval_loss
                             }, step=global_step)
                     else:
                         eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+                        best_eval_loss = min(best_eval_loss, eval_loss)
                         print(f"\nEvaluation loss at step {global_step}: {eval_loss:.4f}")
                         wandb.log({
+                            "trainer/global_step": global_step,
                             "eval/loss": eval_loss,
+                            "val/loss": eval_loss,
                             "eval/step": global_step,
-                            "eval/epoch": fractional_epoch
+                            "val/step": global_step,
+                            "eval/epoch": fractional_epoch,
+                            "val/epoch": fractional_epoch,
+                            "val/best_loss": best_eval_loss
                         }, step=global_step)
 
                 # Checkpointing under DDP using broadcasted decision
@@ -942,18 +959,26 @@ def main():
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             avg_eval_loss = loss_tensor.item()
             if is_main_process:
+                best_eval_loss = min(best_eval_loss, avg_eval_loss)
                 print(f"Epoch {epoch + 1} completed. Train loss: {avg_epoch_loss:.4f} | Eval loss: {avg_eval_loss:.4f}")
                 wandb.log({
+                    "trainer/global_step": global_step,
                     "eval/epoch_loss": avg_eval_loss,
+                    "val/epoch_loss": avg_eval_loss,
+                    "val/best_loss": best_eval_loss,
                     "epoch": epoch + 1,
                     "train/epoch_avg_loss": avg_epoch_loss
                 }, step=global_step)
         else:
             print(f"Running end-of-epoch evaluation for epoch {epoch + 1}...")
             avg_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+            best_eval_loss = min(best_eval_loss, avg_eval_loss)
             print(f"Epoch {epoch + 1} completed. Train loss: {avg_epoch_loss:.4f} | Eval loss: {avg_eval_loss:.4f}")
             wandb.log({
+                "trainer/global_step": global_step,
                 "eval/epoch_loss": avg_eval_loss,
+                "val/epoch_loss": avg_eval_loss,
+                "val/best_loss": best_eval_loss,
                 "epoch": epoch + 1,
                 "train/epoch_avg_loss": avg_epoch_loss
             }, step=global_step)

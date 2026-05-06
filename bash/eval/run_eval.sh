@@ -1,1 +1,1 @@
-python script/evaluation/unified_evaluator.py --config recipe/eval_recipe/unified_eval.yaml
+python script/evaluation/unified_evaluator.py --config recipe/eval_recipe/unified_eval_v2.yaml

@@ -180,7 +180,6 @@ def setup_models(model_config: Dict[str, Any], device: str = "cuda", dtype: torc
             projector_list.append(projector.to(device))
     
     K = 1
-
     rosetta_model = RosettaModel(
         model_list=[base_model, teacher_model],
         base_model_idx=0,

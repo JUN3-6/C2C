@@ -121,7 +121,7 @@ def setup_models(model_config: Dict[str, Any], device: str = "cuda", dtype: torc
     rosetta_model = RosettaModel(
         model_list=[base_model, teacher_model],
         base_model_idx=0,
-        projector_list=[projector]
+        projector_list=[projector],
     ).to(device)
     
     # Configure projector mappings

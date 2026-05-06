@@ -1,0 +1,35 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen2.5-0.5B-Instruct
+    is_do_alignment: false
+    alignment_strategy: "longest"
+    checkpoints_dir: /home/june/workspace/C2C_gate_test/local/checkpoints/0.6+0.5B_C2C_general_again/final
+    include_response: false
+    static_gate_enabled: false
+    entropy_gate_enabled: false
+    multi_source_fusion_mode: sequential
+    update_decode_past: false
+    routing:
+      projector_bank_dirs:
+        - /home/june/workspace/C2C_gate_test/local/checkpoints/0.6+0.5B_C2C_general_again/final
+        - /home/june/workspace/C2C_gate_test/local/checkpoints/0.6B+0.5B_MMLU_15k/final
+      router_dir: local/router_runs/e2e_noskip_two_projectors_mmlu_openhermes_half_responsece_actionce_frozen_full29660_max2048_ep1/router
+      fuse_threshold: 0.5
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/noskip_two_projector_mmlu_openhermes_ceval_full_router
+
+eval:
+  dataset: ceval
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  math_grading_method: "comprehensive"

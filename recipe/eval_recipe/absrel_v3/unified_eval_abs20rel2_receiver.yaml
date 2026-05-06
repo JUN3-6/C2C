@@ -1,0 +1,18 @@
+model:
+  model_name: Qwen/Qwen3-0.6B
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/abs20rel2_receiver_generate
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  math_grading_method: "comprehensive"

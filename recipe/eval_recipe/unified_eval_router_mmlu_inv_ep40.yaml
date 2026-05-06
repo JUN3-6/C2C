@@ -1,0 +1,33 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen2.5-0.5B-Instruct
+    is_do_alignment: false
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/0.6B+0.5B_MMLU_15k/final
+    include_response: false
+    static_gate_enabled: false
+    entropy_gate_enabled: false
+    routing:
+      projector_bank_dirs:
+        - local/checkpoints/0.6B+0.5B_MMLU_15k/final
+        - local/checkpoints/0.6B+0.5B_MMLU_15k/final
+      router_dir: local/router_runs/0.6B+0.5B_MMLU_15k_router_inv_ep40/router
+      fuse_threshold: 0.5
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/routing_mmlu_15k_router_inv_ep40
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  math_grading_method: "comprehensive"

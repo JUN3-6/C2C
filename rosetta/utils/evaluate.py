@@ -15,6 +15,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rosetta.model.projector import load_projector
+from rosetta.model.router import load_router
 from rosetta.model.wrapper import RosettaModel
 from rosetta.model.oracle import OracleRosettaModel
 
@@ -247,6 +248,103 @@ def apply_generation_config(model: Any, generation_config: Optional[Dict[str, An
                 pass
 
 
+def _find_router_config_file(router_dir: str) -> Optional[str]:
+    for name in ("router.json", "router_config.json"):
+        path = os.path.join(router_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _find_router_weight_file(router_dir: str) -> Optional[str]:
+    for name in ("router.pt", "router.bin"):
+        path = os.path.join(router_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_router_module(
+    router_dir: Optional[str],
+    device: torch.device,
+    num_banks: int,
+):
+    if router_dir is None:
+        return None
+
+    router_config_path = _find_router_config_file(router_dir)
+    if router_config_path is None:
+        raise FileNotFoundError(
+            f"Could not find router config in {router_dir}. "
+            "Expected router.json or router_config.json."
+        )
+
+    router = load_router(router_config_path, override_args={"num_banks": num_banks})
+    router = router.to(device)
+
+    router_weights_path = _find_router_weight_file(router_dir)
+    if router_weights_path is not None:
+        state_dict = torch.load(router_weights_path, map_location=device)
+        router.load_state_dict(state_dict, strict=False)
+    return router
+
+
+def _load_projectors_and_config(
+    checkpoint_dir: str,
+    device: torch.device,
+):
+    if checkpoint_dir is None:
+        raise KeyError(
+            "checkpoints_dir must be provided under model.rosetta_config or eval config"
+        )
+    num_projectors = len(
+        [f for f in os.listdir(checkpoint_dir) if re.match(r"projector_\d+\.pt", f)]
+    )
+    projector_list = []
+    projector_classes = []
+    for proj_idx in range(num_projectors):
+        json_cfg = os.path.join(checkpoint_dir, f"projector_{proj_idx}.json")
+        proj = load_projector(json_cfg)
+        projector_classes.append(proj.__class__.__name__)
+        proj = proj.to(device)
+        pt_path = os.path.join(checkpoint_dir, f"projector_{proj_idx}.pt")
+        if os.path.exists(pt_path):
+            state_dict = torch.load(pt_path, map_location=device)
+            proj.load_state_dict(state_dict, strict=False)
+        projector_list.append(proj)
+
+    config_path = os.path.join(checkpoint_dir, "projector_bank_config.json")
+    if not os.path.exists(config_path):
+        config_path = os.path.join(checkpoint_dir, "projector_config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Could not find projector config in {checkpoint_dir}"
+        )
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    return projector_list, projector_classes, config
+
+
+def _adjust_config_indices(config_dict, proj_offset, actual_source_idx=None):
+    adjusted = {}
+    for target_model_idx, sources in config_dict.items():
+        adjusted[int(target_model_idx)] = {}
+        for source_model_idx, layers in sources.items():
+            actual_src_idx = (
+                actual_source_idx if actual_source_idx is not None else int(source_model_idx)
+            )
+            adjusted[int(target_model_idx)][actual_src_idx] = {}
+            for target_layer_idx, mappings in layers.items():
+                adjusted_mappings = []
+                for source_layer_idx, idx in mappings:
+                    adjusted_mappings.append((source_layer_idx, idx + proj_offset))
+                adjusted[int(target_model_idx)][actual_src_idx][
+                    int(target_layer_idx)
+                ] = adjusted_mappings
+    return adjusted
+
+
 def set_default_chat_template(tokenizer, model_name: str):
     """
     Set default chat template for models without one.
@@ -341,21 +439,44 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
     rosetta_config = model_config["rosetta_config"]
     slm_model_path = rosetta_config["base_model"]
     teacher_model_config = rosetta_config["teacher_model"]
-
-    # Dict of models with list of checkpoints: {"model_name": "model_path", ...} + ckpt: ["ckpt1", "ckpt2"]
+    routing_config = rosetta_config.get("routing", {})
+    static_gate_enabled = rosetta_config.get("static_gate_enabled", True)
+    entropy_gate_enabled = rosetta_config.get("entropy_gate_enabled", True)
+    threshold_abs = rosetta_config.get("threshold_abs", 0.45)
+    threshold_rel = rosetta_config.get("threshold_rel", 0.15)
+    include_response = rosetta_config.get("include_response", False)
+    multi_source_fusion_mode = rosetta_config.get("multi_source_fusion_mode", "sequential")
+    update_decode_past = rosetta_config.get("update_decode_past", True)
+    router_fuse_threshold = routing_config.get(
+        "fuse_threshold",
+        rosetta_config.get("router_fuse_threshold", 0.5),
+    )
+    projector_bank_dirs = routing_config.get(
+        "projector_bank_dirs",
+        rosetta_config.get("projector_bank_dirs"),
+    )
+    router_dir = routing_config.get("router_dir", rosetta_config.get("router_dir"))
+    checkpoint_dir_value = rosetta_config.get(
+        "checkpoints_dir",
+        eval_config.get("checkpoints_dir"),
+    )
     
     llm_configs = []  # List of (model_path, checkpoint_dir) tuples
     
     if isinstance(teacher_model_config, str):
-        # Single model - backward compatibility
-        checkpoint_dir = rosetta_config.get("checkpoints_dir", eval_config.get("checkpoints_dir"))
+        checkpoint_dir = checkpoint_dir_value
+        if projector_bank_dirs is None and isinstance(checkpoint_dir_value, list):
+            projector_bank_dirs = checkpoint_dir_value
+            checkpoint_dir = checkpoint_dir_value[0] if checkpoint_dir_value else None
         llm_configs.append((teacher_model_config, checkpoint_dir))
     
     elif isinstance(teacher_model_config, dict):
-        # Format 4: Dict format with separate ckpt list
-        # teacher_model: {"model1_name": "model1_path", "model2_name": "model2_path"}
-        # ckpt: ["ckpt1_path", "ckpt2_path"]
-        checkpoints_dir = rosetta_config.get("checkpoints_dir", [])
+        if projector_bank_dirs is not None or router_dir is not None:
+            raise ValueError(
+                "Routing v1 supports single-teacher only. "
+                "Use a single teacher_model with projector_bank_dirs/router_dir."
+            )
+        checkpoints_dir = checkpoint_dir_value or []
         model_items = list(teacher_model_config.items())
         
         if len(checkpoints_dir) != len(model_items):
@@ -398,99 +519,121 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
         # Apply generation config to LLM
         apply_generation_config(llm_model, generation_config)
         llm_models.append(llm_model)
-    
-     # Load projectors for each LLM from their respective checkpoint directories
-    # Each checkpoint directory contains standard format: projector_{idx}.pt
+
+    model_list = [slm_model] + llm_models
+
+    if projector_bank_dirs is not None or router_dir is not None:
+        if not isinstance(teacher_model_config, str):
+            raise ValueError("Routing loader requires a single teacher_model string")
+        if projector_bank_dirs is None:
+            checkpoint_dir = llm_configs[0][1]
+            if checkpoint_dir is None:
+                raise KeyError(
+                    "projector_bank_dirs or checkpoints_dir must be provided for routing"
+                )
+            projector_bank_dirs = [checkpoint_dir]
+
+        projector_list = []
+        projector_bank_dicts = []
+        expected_projector_classes = None
+
+        for bank_dir in projector_bank_dirs:
+            bank_projectors, projector_classes, raw_config = _load_projectors_and_config(
+                bank_dir,
+                device,
+            )
+            if raw_config.get("format") == "projector_banks_v1":
+                bank_configs = raw_config.get("bank_configs", [])
+                if len(bank_configs) != 1:
+                    raise ValueError(
+                        "projector_bank_dirs must point to single-bank checkpoint directories"
+                    )
+                raw_config = bank_configs[0]
+
+            if expected_projector_classes is None:
+                expected_projector_classes = projector_classes
+            elif projector_classes != expected_projector_classes:
+                raise ValueError(
+                    "All routing banks must share the same projector type ordering"
+                )
+
+            proj_offset = len(projector_list)
+            projector_list.extend(bank_projectors)
+            projector_bank_dicts.append(
+                _adjust_config_indices(raw_config, proj_offset, actual_source_idx=1)
+            )
+
+        if len(projector_bank_dicts) > 1 and router_dir is None:
+            candidate_router_dir = projector_bank_dirs[0]
+            if _find_router_config_file(candidate_router_dir) is not None:
+                router_dir = candidate_router_dir
+            else:
+                raise ValueError(
+                    "Multiple projector banks require router_dir (or router files "
+                    "co-located in the first bank directory)."
+                )
+
+        router = _load_router_module(router_dir, device, len(projector_bank_dicts))
+        rosetta_model = RosettaModel(
+            model_list=model_list,
+            base_model_idx=0,
+            projector_list=projector_list,
+            router=router,
+            projector_bank_dicts=projector_bank_dicts,
+            router_fuse_threshold=router_fuse_threshold,
+            include_response=include_response,
+            multi_source_fusion_mode=multi_source_fusion_mode,
+            static_gate_enabled=static_gate_enabled,
+            entropy_gate_enabled=entropy_gate_enabled,
+            threshold_abs=threshold_abs,
+            threshold_rel=threshold_rel,
+            update_decode_past=update_decode_past,
+        ).to(device).eval()
+        return rosetta_model, slm_tokenizer
+
     projector_list = []
-    num_llms = len(llm_models)
-    
-    # Track projector offset for each LLM (for config index adjustment)
     projector_offsets = [0]
-    
-    for llm_idx, (_, checkpoint_dir) in enumerate(llm_configs):
-        # Load projectors from this LLM's checkpoint directory
-        # Standard naming: projector_{proj_idx}.pt / .json
-        num_projectors = len([f for f in os.listdir(checkpoint_dir) 
-                             if re.match(r"projector_\d+\.pt", f)])
-        
-        for proj_idx in range(num_projectors):
-            json_cfg = os.path.join(checkpoint_dir, f"projector_{proj_idx}.json")
-            proj = load_projector(json_cfg)
-            proj = proj.to(device)
-            pt_path = os.path.join(checkpoint_dir, f"projector_{proj_idx}.pt")
-            if os.path.exists(pt_path):
-                state_dict = torch.load(pt_path, map_location=device)
-                proj.load_state_dict(state_dict, strict=False)
-            projector_list.append(proj)
-        
-        # Record offset for next LLM
+    raw_projector_configs = []
+
+    for _, checkpoint_dir in llm_configs:
+        bank_projectors, _, raw_config = _load_projectors_and_config(checkpoint_dir, device)
+        if raw_config.get("format") == "projector_banks_v1":
+            bank_configs = raw_config.get("bank_configs", [])
+            if len(bank_configs) != 1:
+                raise ValueError(
+                    "Legacy multi-source loading expects one bank per checkpoint directory"
+                )
+            raw_config = bank_configs[0]
+        projector_list.extend(bank_projectors)
+        raw_projector_configs.append(raw_config)
         projector_offsets.append(len(projector_list))
 
-    # Initialize Rosetta model
-    # model_list: [slm_model, llm_model_1, llm_model_2, ...]
-    model_list = [slm_model] + llm_models
-    
-    # Get multi-source fusion mode from config (default to "sequential" for backward compatibility)
-    multi_source_fusion_mode = rosetta_config.get("multi_source_fusion_mode", "sequential")
-    include_response = rosetta_config.get("include_response", False)
-    
     rosetta_model = RosettaModel(
         model_list=model_list,
         base_model_idx=0,
         projector_list=projector_list,
         include_response=include_response,
         multi_source_fusion_mode=multi_source_fusion_mode,
+        static_gate_enabled=static_gate_enabled,
+        entropy_gate_enabled=entropy_gate_enabled,
+        threshold_abs=threshold_abs,
+        threshold_rel=threshold_rel,
+        update_decode_past=update_decode_past,
     ).to(device).eval()
 
-    # Load projector mapping configs from each LLM's checkpoint directory
-    # Each directory has standard config file: projector_config.json
-    
-    # Helper function to adjust config indices for flattened lists
-    def adjust_config_indices(config_dict, proj_offset, actual_source_idx=None):
-        """Adjust projector indices in config dict by adding offsets.
-        
-        Args:
-            config_dict: Original config dictionary
-            proj_offset: Offset for projector indices
-            actual_source_idx: If provided, remap all source_model_idx to this value
-        """
-        adjusted = {}
-        for target_model_idx, sources in config_dict.items():
-            adjusted[int(target_model_idx)] = {}
-            for source_model_idx, layers in sources.items():
-                # Use actual_source_idx if provided, otherwise keep original
-                actual_src_idx = actual_source_idx if actual_source_idx is not None else int(source_model_idx)
-                adjusted[int(target_model_idx)][actual_src_idx] = {}
-                for target_layer_idx, mappings in layers.items():
-                    adjusted_mappings = []
-                    for source_layer_idx, idx in mappings:
-                        # Adjust the projector index
-                        adjusted_idx = idx + proj_offset
-                        adjusted_mappings.append((source_layer_idx, adjusted_idx))
-                    adjusted[int(target_model_idx)][actual_src_idx][int(target_layer_idx)] = adjusted_mappings
-        return adjusted
-    
-    # Load and merge configs from each LLM's checkpoint directory
-    for llm_idx, (_, checkpoint_dir) in enumerate(llm_configs):
-        proj_cfg_path = os.path.join(checkpoint_dir, "projector_config.json")
-        
-        # Actual source model index in model_list (llm_idx=0 -> model_list[1], llm_idx=1 -> model_list[2], etc.)
-        actual_source_model_idx = llm_idx + 1
-        
-        # Load projector config
-        if os.path.exists(proj_cfg_path):
-            with open(proj_cfg_path, 'r') as f:
-                config = json.load(f)
-                # Adjust projector indices based on offset and set actual source_idx
-                adjusted_config = adjust_config_indices(config, projector_offsets[llm_idx], actual_source_model_idx)
-                # Merge into rosetta_model.projector_dict
-                for target_idx, sources in adjusted_config.items():
-                    if target_idx not in rosetta_model.projector_dict:
-                        rosetta_model.projector_dict[target_idx] = {}
-                    for source_idx, layers in sources.items():
-                        if source_idx not in rosetta_model.projector_dict[target_idx]:
-                            rosetta_model.projector_dict[target_idx][source_idx] = {}
-                        rosetta_model.projector_dict[target_idx][source_idx].update(layers)
+    for llm_idx, raw_config in enumerate(raw_projector_configs):
+        adjusted_config = _adjust_config_indices(
+            raw_config,
+            projector_offsets[llm_idx],
+            actual_source_idx=llm_idx + 1,
+        )
+        for target_idx, sources in adjusted_config.items():
+            if target_idx not in rosetta_model.projector_dict:
+                rosetta_model.projector_dict[target_idx] = {}
+            for source_idx, layers in sources.items():
+                if source_idx not in rosetta_model.projector_dict[target_idx]:
+                    rosetta_model.projector_dict[target_idx][source_idx] = {}
+                rosetta_model.projector_dict[target_idx][source_idx].update(layers)
 
     return rosetta_model, slm_tokenizer
 
@@ -719,4 +862,3 @@ def generate_answer_with_generate(model, tokenizer, prompt: str, device: torch.d
     gen_length = generated_ids.shape[0]
 
     return pred, probs, input_length, gen_length, content
-

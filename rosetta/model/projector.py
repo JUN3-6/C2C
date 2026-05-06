@@ -15,6 +15,12 @@ from rosetta.utils.registry import register_model, get_projector_class, PROJECTO
 class Projector(nn.Module):
     """Base projector class for unified memory"""
     
+    def is_gate_open(self) -> bool:
+        """Return True if this projector's gate is open during inference.
+        When False, the projector output equals the target input, so calling
+        forward can be skipped entirely."""
+        return True
+
     def forward(self, source_kv: Tuple[Tensor, Tensor], target_kv: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         """
         Project and combine the source key-value tensors to the target key-value tensors
@@ -769,6 +775,13 @@ class AllInOneProjector(Projector):
         
         return (output_key, output_value)
 
+    def is_gate_open(self) -> bool:
+        if self.training:
+            return True
+        if self.gate_depends_on_input:
+            return True
+        return bool((self.gate_logit > 0).any())
+
 class QwenStyleLayer(nn.Module):
     """
     One Qwen3-style MLP sublayer:
@@ -944,6 +957,11 @@ class C2CProjector(Projector):
         temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
         self.gate_temperature.fill_(temp)
 
+    def is_gate_open(self) -> bool:
+        if self.training:
+            return True
+        return bool(self.key_gate_logit.item() > 0 or self.value_gate_logit.item() > 0)
+
     def forward(
         self,
         source_kv: Tuple[Tensor, Tensor],
@@ -956,36 +974,81 @@ class C2CProjector(Projector):
 
         B, Hs, N, Ds = source_key.shape
         _, Ht, _, Dt = target_key.shape
-
+        
+        # A. sharer/receiver cache를 load하는 구간
+        torch.cuda.nvtx.range_push("fuser.load_cache")
+        
         # Flatten heads
         source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
         source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
         target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
         target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
 
+        # A. load cache 구간 종료
+        torch.cuda.nvtx.range_pop()
+        
+        
+        # B. concat 구간
+        torch.cuda.nvtx.range_push("fuser.concat")
+        
         # 1) concat source and target features along channel
         key_cat = torch.cat([source_key_flat, target_key_flat], dim=-1)
         value_cat = torch.cat([source_value_flat, target_value_flat], dim=-1)
-
+        
+        # B. concat 구간 종료
+        torch.cuda.nvtx.range_pop()
+    
+    
+        # C. project to hidden dim 구간
+        torch.cuda.nvtx.range_push("fuser.concat_2_project")
+    
         # 2) project to hidden dim
         key_hidden = self.key_in(key_cat)
         value_hidden = self.value_in(value_cat)
 
+        # C. project to hidden dim 구간 종료
+        torch.cuda.nvtx.range_pop()
+    
+    
+        # D. Projection 구간
+        torch.cuda.nvtx.range_push("fuser.projection")
+        
         # 3) one-layer common embedding MLP to get intermediate representation (at hidden_dim)
         key_hidden = self.key_mlp1(key_hidden)
         value_hidden = self.value_mlp1(value_hidden)
+        
+        # D. Projection 구간 종료
+        torch.cuda.nvtx.range_pop()
 
+
+        # E. Projected feature path 구간
+        torch.cuda.nvtx.range_push("fuser.feature_fusion")
+        
         # 4b) intermediate representation -> projected feature path
         key_proj_hidden = self.key_proj_out(self.key_proj_mlp2(key_hidden)) # (B, N, Ht * Dt)
         value_proj_hidden = self.value_proj_out(self.value_proj_mlp2(value_hidden)) # (B, N, Ht * Dt)
         projected_key = key_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
         projected_value = value_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
+        
+        # E. Projected feature path 구간 종료
+        torch.cuda.nvtx.range_pop()
     
+    
+        # F. Scalar path 구간
+        torch.cuda.nvtx.range_push("fuser.dynamic_weight")
+        
         # 4a) intermediate representation -> scalar path
         key_scalar = self.key_scalar_head(self.key_scalar_mlp2(key_hidden))       # (B, N, Ht)
         value_scalar = self.value_scalar_head(self.value_scalar_mlp2(value_hidden)) # (B, N, Ht)
         key_scalar = key_scalar.permute(0, 2, 1).unsqueeze(-1)   # (B, Ht, N, 1)
         value_scalar = value_scalar.permute(0, 2, 1).unsqueeze(-1)  # (B, Ht, N, 1)
+
+        # F. Scalar path 구간 종료
+        torch.cuda.nvtx.range_pop()
+        
+        
+        # G. Gating 구간
+        torch.cuda.nvtx.range_push("fuser.gate_load")
 
         # Key/value gates: element-wise Gumbel noise with scalar logits (broadcast over channels)
         key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
@@ -1001,13 +1064,31 @@ class C2CProjector(Projector):
             key_gate = (key_gate_logit > 0).float()
             value_gate = (value_gate_logit > 0).float()
 
+        # G. Gating 구간 종료
+        torch.cuda.nvtx.range_pop()
+
+
+        # H. dynamic weight normalization 구간
+        torch.cuda.nvtx.range_push("fuser.dynamic_weight_norm")
+    
         # Normalize scalars (scalar_temperature=1.0)
         norm_key_scalar = torch.sigmoid(key_scalar)
         norm_value_scalar = torch.sigmoid(value_scalar)
 
-        # Combine (preserve_target_weight=False, add_self=True)
+        # H. dynamic weight normalization 구간 종료
+        torch.cuda.nvtx.range_pop()
+
+        # I. write cache 구간
+        torch.cuda.nvtx.range_push("fuser.write_cache")
+        
+        # Combine (preserve_target_weight=False, add_self=True).
+        # The saved projectors were trained with these learned key/value gates;
+        # dropping them changes the meaning of "all fusion" for old checkpoints.
         output_key = target_key + key_gate * norm_key_scalar * projected_key
         output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        # I. write cache 구간 종료
+        torch.cuda.nvtx.range_pop()
 
         # Expose capture attributes for downstream analysis scripts
         try:
