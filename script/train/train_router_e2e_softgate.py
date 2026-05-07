@@ -105,6 +105,36 @@ def set_module_dropout(module: torch.nn.Module, dropout_p: Optional[float]) -> N
             submodule.p = float(dropout_p)
 
 
+def parse_device_list(devices: str) -> List[torch.device]:
+    parsed = [torch.device(item.strip()) for item in devices.split(",") if item.strip()]
+    if not parsed:
+        raise ValueError("--projector-devices must contain at least one device.")
+    return parsed
+
+
+def distribute_projectors(
+    projectors: Sequence[torch.nn.Module],
+    devices: Sequence[torch.device],
+) -> None:
+    if not devices:
+        return
+    counts = {str(device): 0 for device in devices}
+    for idx, projector in enumerate(projectors):
+        target_device = devices[idx % len(devices)]
+        projector.to(target_device)
+        counts[str(target_device)] = counts.get(str(target_device), 0) + 1
+    print(
+        "Projector device placement: "
+        + ", ".join(f"{device}={count}" for device, count in counts.items())
+    )
+
+
+def first_parameter_device(module: torch.nn.Module, fallback: torch.device) -> torch.device:
+    for param in module.parameters():
+        return param.device
+    return fallback
+
+
 def _offset_bank_config_projector_indices(config: Any, offset: int) -> Any:
     if isinstance(config, dict):
         return {
@@ -455,14 +485,19 @@ def soft_fuse_cache(
 
         projected_pairs = []
         for source_layer_idx, projector_idx in _entry_pairs(entry):
-            source_kv = (
-                source_cache.key_cache[int(source_layer_idx)],
-                source_cache.value_cache[int(source_layer_idx)],
-            )
             projector = projector_list[int(projector_idx)]
+            projector_device = first_parameter_device(projector, base_key.device)
+            source_kv = (
+                source_cache.key_cache[int(source_layer_idx)].to(projector_device),
+                source_cache.value_cache[int(source_layer_idx)].to(projector_device),
+            )
+            projector_target_kv = (
+                base_key.to(projector_device),
+                base_value.to(projector_device),
+            )
             grad_context = nullcontext() if any(p.requires_grad for p in projector.parameters()) else torch.no_grad()
             with grad_context:
-                projected_pairs.append(projector(source_kv, target_kv))
+                projected_pairs.append(projector(source_kv, projector_target_kv))
 
         if not projected_pairs:
             continue
@@ -1979,6 +2014,15 @@ def main() -> None:
         ),
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--projector-devices",
+        default=None,
+        help=(
+            "Comma-separated devices for projector modules, e.g. cuda:0,cuda:1. "
+            "This shards expert projector parameters and Adam states across GPUs; "
+            "base/source/router remain on --device."
+        ),
+    )
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(
         "--router-dtype",
@@ -2047,6 +2091,11 @@ def main() -> None:
     data_config = dict(cfg["data"])
 
     device = resolve_device(args.device)
+    projector_devices = (
+        parse_device_list(args.projector_devices)
+        if args.projector_devices
+        else [device]
+    )
     dtype = parse_dtype(args.dtype)
     router_dtype = parse_dtype(args.router_dtype) if args.router_dtype else dtype
     base_model, source_model, base_tokenizer, source_tokenizer = load_models_and_tokenizers(
@@ -2096,6 +2145,7 @@ def main() -> None:
         mode=args.projector_train_mode,
         trainable_name_substrings=args.projector_trainable_name_substring,
     )
+    distribute_projectors(projector_list, projector_devices)
 
     num_examples = min(args.num_samples, len(supervised_dataset))
     all_indices = list(range(len(supervised_dataset)))
