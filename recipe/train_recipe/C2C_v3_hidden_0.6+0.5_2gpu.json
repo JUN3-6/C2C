@@ -40,9 +40,9 @@
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
-            "project": "Rosetta",
+            "project": "C2C",
             "mode": "online",
-            "entity": "joon0103",
+            "entity": "june6-hanyang-university",
             "run_name": "0.6+0.5B_C2C_v3_hidden_MMLU_15k_2gpu"
         }
     },
