@@ -691,7 +691,13 @@ class LongBenchChatDataset(Dataset):
 class MMLUChatDataset(Dataset):
     """Simple MMLU dataset converted to chat format"""
 
-    def __init__(self, split: str = "train", num_samples: Optional[int] = None, max_word_count: Optional[int] = None):
+    def __init__(
+        self,
+        split: str = "train",
+        num_samples: Optional[int] = None,
+        max_word_count: Optional[int] = None,
+        cache_dir: Optional[str] = None,
+    ):
         """
         Initialize the dataset
 
@@ -699,10 +705,11 @@ class MMLUChatDataset(Dataset):
             split: Dataset split
             num_samples: Number of samples to use (None for all)
             max_word_count: If set, drop samples whose question + all choices exceed this word count
+            cache_dir: Optional Hugging Face datasets cache directory.
         """
         print(f"Loading MMLU dataset (split: {split})...")
         # Load dataset
-        dataset = load_dataset("cais/mmlu", "all")
+        dataset = load_dataset("cais/mmlu", "all", cache_dir=cache_dir)
         dataset = dataset[split]
 
         # Ensure we have a proper Dataset object
@@ -987,7 +994,14 @@ class OpenBookChatDataset(Dataset):
 class OpenHermesChatDataset(Dataset):
     """Simple general dataset converted to chat format"""
 
-    def __init__(self, split: str = "train", num_samples: Optional[int] = None, max_word_count: Optional[int] = None, min_conversation_turns: int = 0):
+    def __init__(
+        self,
+        split: str = "train",
+        num_samples: Optional[int] = None,
+        max_word_count: Optional[int] = None,
+        min_conversation_turns: int = 0,
+        cache_dir: Optional[str] = None,
+    ):
         """
         Initialize the dataset
 
@@ -996,10 +1010,11 @@ class OpenHermesChatDataset(Dataset):
             num_samples: Number of samples to use (None for all)
             max_word_count: Maximum token count for filtering
             min_conversation_turns: Minimum number of conversation turns (default 3 for multi-turn conversations)
+            cache_dir: Optional Hugging Face datasets cache directory.
         """
         print(f"Loading OpenHermes dataset (split: {split})...")
         # Load dataset
-        dataset = load_dataset("teknium/OpenHermes-2.5")
+        dataset = load_dataset("teknium/OpenHermes-2.5", cache_dir=cache_dir)
         dataset = dataset[split]
 
         # Ensure we have a proper Dataset object
