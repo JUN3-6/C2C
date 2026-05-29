@@ -41,8 +41,8 @@
         "eval_steps": 100,
         "wandb_config": {
             "project": "Rosetta",
-            "mode": "disabled",
-            "entity": "nics-efc",
+            "mode": "online",
+            "entity": "joon0103",
             "run_name": "0.6+0.5B_C2C_v3_hidden_MMLU_15k_2gpu"
         }
     },
