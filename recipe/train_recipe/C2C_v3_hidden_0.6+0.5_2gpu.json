@@ -32,7 +32,6 @@
         "gradient_accumulation_steps": 32,
         "per_device_train_batch_size": 4,
         "num_processes": 2,
-        "find_unused_parameters": false,
         "freeze": ["teacher", "base"],
         "seed": 42
     },

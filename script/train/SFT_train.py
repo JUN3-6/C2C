@@ -609,14 +609,11 @@ def main():
 
     # Wrap with DDP if needed
     if distributed:
-        find_unused_parameters = training_config.get("find_unused_parameters", False)
-        if is_main_process:
-            print(f"DDP find_unused_parameters={find_unused_parameters}")
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=find_unused_parameters
+            find_unused_parameters=True
         )
 
     total_params = sum(p.numel() for p in model.parameters())
