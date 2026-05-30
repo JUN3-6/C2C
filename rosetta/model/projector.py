@@ -1193,6 +1193,168 @@ class C2CLCFProjector(Projector):
 register_model("LCFProjector")(C2CLCFProjector)
 register_model("LatentCacheFlowProjector")(C2CLCFProjector)
 
+@register_model
+@capture_init_args
+class C2CKVAlignmentProjector(Projector):
+    """
+    Per-layer C2C adaptation of K-V cache alignment through a shared latent space.
+
+    The paper learns model-specific maps into and out of a global shared KV
+    space. The C2C wrapper calls projectors one layer at a time, so this class
+    implements the same idea locally:
+
+        source K/V -> source-to-shared adapters -> shared mixer
+        -> shared-to-target adapters -> gated target KV residual.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        shared_dim: int = 1024,
+        intermediate_dim: int = 1024,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 400,
+        dtype: torch.dtype = torch.float32,
+        gate_init: float = 0.0,
+        zero_init: bool = False,
+        up_proj_scale: Optional[float] = None,
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.shared_dim = shared_dim
+        self.intermediate_dim = intermediate_dim
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.key_to_shared_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.value_to_shared_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.key_to_shared = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.value_to_shared = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.act = nn.GELU()
+
+        self.shared_mixer = RegularMLP(
+            hidden_dim=shared_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            dtype=dtype,
+        )
+
+        self.key_from_shared_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.value_from_shared_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.key_from_shared = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+        self.value_from_shared = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+
+        if zero_init:
+            nn.init.zeros_(self.key_from_shared.weight)
+            nn.init.zeros_(self.key_from_shared.bias)
+            nn.init.zeros_(self.value_from_shared.weight)
+            nn.init.zeros_(self.value_from_shared.bias)
+        elif up_proj_scale is not None:
+            nn.init.kaiming_uniform_(self.key_from_shared.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.value_from_shared.weight, a=math.sqrt(5))
+            self.key_from_shared.weight.data.mul_(up_proj_scale)
+            self.value_from_shared.weight.data.mul_(up_proj_scale)
+            if self.key_from_shared.bias is not None:
+                nn.init.zeros_(self.key_from_shared.bias)
+            if self.value_from_shared.bias is not None:
+                nn.init.zeros_(self.value_from_shared.bias)
+
+        self.key_scalar_head = nn.Linear(shared_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(shared_dim, target_num_heads, dtype=dtype)
+
+        self.key_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.use_gumbel = True
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+        self.scalar_temperature = 1.0
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, Nt, Dt = target_key.shape
+        if Nt != N:
+            raise ValueError(f"source and target KV lengths must match; got {N} and {Nt}")
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+
+        key_shared = self.act(self.key_to_shared(self.key_to_shared_norm(source_key_flat.to(dtype=target_key.dtype))))
+        value_shared = self.act(self.value_to_shared(self.value_to_shared_norm(source_value_flat.to(dtype=target_value.dtype))))
+
+        key_shared = self.shared_mixer(key_shared)
+        value_shared = self.shared_mixer(value_shared)
+
+        key_delta_flat = self.key_from_shared(self.key_from_shared_norm(key_shared))
+        value_delta_flat = self.value_from_shared(self.value_from_shared_norm(value_shared))
+        projected_key = key_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        projected_value = value_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+
+        key_scalar = self.key_scalar_head(key_shared).permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = self.value_scalar_head(value_shared).permute(0, 2, 1).unsqueeze(-1)
+
+        key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
+        value_gate_logit = self.value_gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=value_gate_logit.device, dtype=value_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
+        else:
+            key_gate = (key_gate_logit > 0).float()
+            value_gate = (value_gate_logit > 0).float()
+
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        output_key = target_key + key_gate * norm_key_scalar * projected_key
+        output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("KVAlignmentProjector")(C2CKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentProjector")(C2CKVAlignmentProjector)
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
