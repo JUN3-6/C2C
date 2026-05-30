@@ -1023,6 +1023,176 @@ class C2CProjector(Projector):
 
         return output_key, output_value
 
+@register_model
+@capture_init_args
+class C2CLCFProjector(Projector):
+    """
+    Latent Cache Flow projector for the shared-context C2C path.
+
+    This keeps the existing C2C wrapper interface:
+        forward((source_key, source_value), (target_key, target_value))
+
+    Unlike C2CProjector, key and value are fused by one shared low-dimensional
+    latent pipeline:
+        [SK || SV || RK || RV] -> bottleneck z -> split(zK, zV) -> delta K/V.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        latent_dim: int = 128,
+        intermediate_dim: Optional[int] = None,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 400,
+        dtype: torch.dtype = torch.float32,
+        gate_init: float = 0.0,
+        zero_init: bool = False,
+        up_proj_scale: Optional[float] = None,
+    ):
+        super().__init__()
+
+        if latent_dim % 2 != 0:
+            raise ValueError("latent_dim must be even so it can split into key/value latents")
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+
+        intermediate_dim = intermediate_dim if intermediate_dim is not None else latent_dim * 4
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.latent_dim = latent_dim
+        self.intermediate_dim = intermediate_dim
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+        input_dim = 2 * source_flat_dim + 2 * target_flat_dim
+        output_dim = target_dim * target_num_heads
+        split_dim = latent_dim // 2
+
+        self.down = nn.Linear(input_dim, latent_dim, bias=True, dtype=dtype)
+        self.mlp = RegularMLP(
+            hidden_dim=latent_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            dtype=dtype,
+        )
+
+        self.key_scalar_head = nn.Linear(latent_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(latent_dim, target_num_heads, dtype=dtype)
+        self.key_up = nn.Linear(split_dim, output_dim, bias=True, dtype=dtype)
+        self.value_up = nn.Linear(split_dim, output_dim, bias=True, dtype=dtype)
+
+        if zero_init:
+            nn.init.zeros_(self.key_up.weight)
+            nn.init.zeros_(self.key_up.bias)
+            nn.init.zeros_(self.value_up.weight)
+            nn.init.zeros_(self.value_up.bias)
+        elif up_proj_scale is not None:
+            nn.init.kaiming_uniform_(self.key_up.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.value_up.weight, a=math.sqrt(5))
+            self.key_up.weight.data.mul_(up_proj_scale)
+            self.value_up.weight.data.mul_(up_proj_scale)
+            if self.key_up.bias is not None:
+                nn.init.zeros_(self.key_up.bias)
+            if self.value_up.bias is not None:
+                nn.init.zeros_(self.value_up.bias)
+
+        self.key_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.use_gumbel = True
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+        self.scalar_temperature = 1.0
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, Nt, Dt = target_key.shape
+        if Nt != N:
+            raise ValueError(f"source and target KV lengths must match; got {N} and {Nt}")
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+        target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+
+        joint = torch.cat(
+            [
+                source_key_flat.to(dtype=target_key.dtype),
+                source_value_flat.to(dtype=target_key.dtype),
+                target_key_flat,
+                target_value_flat.to(dtype=target_key.dtype),
+            ],
+            dim=-1,
+        )
+
+        z = self.mlp(self.down(joint))
+        key_latent, value_latent = torch.chunk(z, chunks=2, dim=-1)
+
+        key_delta_flat = self.key_up(key_latent)
+        value_delta_flat = self.value_up(value_latent.to(dtype=target_value.dtype))
+        projected_key = key_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        projected_value = value_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+
+        key_scalar = self.key_scalar_head(z).permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = self.value_scalar_head(z).permute(0, 2, 1).unsqueeze(-1)
+
+        key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
+        value_gate_logit = self.value_gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=value_gate_logit.device, dtype=value_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
+        else:
+            key_gate = (key_gate_logit > 0).float()
+            value_gate = (value_gate_logit > 0).float()
+
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        output_key = target_key + key_gate * norm_key_scalar * projected_key
+        output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("LCFProjector")(C2CLCFProjector)
+register_model("LatentCacheFlowProjector")(C2CLCFProjector)
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
