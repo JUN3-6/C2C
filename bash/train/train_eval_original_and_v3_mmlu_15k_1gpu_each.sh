@@ -27,14 +27,14 @@ original_train_pid=$!
 
 CUDA_VISIBLE_DEVICES="${V3_GPU}" torchrun --nproc_per_node=1 --master_port="${V3_PORT}" \
     script/train/SFT_train_v3.py --config "${V3_TRAIN_CONFIG}" \
-    > "${LOG_DIR}/train_v3_hidden_gpu${V3_GPU}.log" 2>&1 &
+    > "${LOG_DIR}/train_v3_hidden_concat_gpu${V3_GPU}.log" 2>&1 &
 v3_train_pid=$!
 
 echo "Original C2C train PID ${original_train_pid} on GPU ${ORIGINAL_GPU}"
-echo "V3 hidden train PID ${v3_train_pid} on GPU ${V3_GPU}"
+echo "V3 hidden-concat train PID ${v3_train_pid} on GPU ${V3_GPU}"
 echo "Train logs:"
 echo "  ${LOG_DIR}/train_original_c2c_gpu${ORIGINAL_GPU}.log"
-echo "  ${LOG_DIR}/train_v3_hidden_gpu${V3_GPU}.log"
+echo "  ${LOG_DIR}/train_v3_hidden_concat_gpu${V3_GPU}.log"
 
 set +e
 wait "${original_train_pid}"
@@ -56,14 +56,14 @@ original_eval_pid=$!
 
 CUDA_VISIBLE_DEVICES="${V3_GPU}" python script/evaluation/unified_evaluator_v3.py \
     --config "${V3_EVAL_CONFIG}" \
-    > "${LOG_DIR}/eval_mmlu_redux_v3_hidden_gpu${V3_GPU}.log" 2>&1 &
+    > "${LOG_DIR}/eval_mmlu_redux_v3_hidden_concat_gpu${V3_GPU}.log" 2>&1 &
 v3_eval_pid=$!
 
 echo "Original C2C eval PID ${original_eval_pid} on GPU ${ORIGINAL_GPU}"
-echo "V3 hidden eval PID ${v3_eval_pid} on GPU ${V3_GPU}"
+echo "V3 hidden-concat eval PID ${v3_eval_pid} on GPU ${V3_GPU}"
 echo "Eval logs:"
 echo "  ${LOG_DIR}/eval_mmlu_redux_original_c2c_gpu${ORIGINAL_GPU}.log"
-echo "  ${LOG_DIR}/eval_mmlu_redux_v3_hidden_gpu${V3_GPU}.log"
+echo "  ${LOG_DIR}/eval_mmlu_redux_v3_hidden_concat_gpu${V3_GPU}.log"
 
 set +e
 wait "${original_eval_pid}"

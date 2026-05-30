@@ -30,6 +30,10 @@ class RosettaModel(BaseRosettaModel):
     def _uses_source_hidden_states(projector) -> bool:
         return bool(getattr(projector, "uses_source_hidden_states", False))
 
+    @staticmethod
+    def _uses_target_hidden_states(projector) -> bool:
+        return bool(getattr(projector, "uses_target_hidden_states", False))
+
     def _source_requires_hidden_states(self, source_model_idx: int) -> bool:
         if self.base_model_idx not in self.projector_dict:
             return False
@@ -41,41 +45,62 @@ class RosettaModel(BaseRosettaModel):
                     return True
         return False
 
+    def _target_requires_hidden_states(self) -> bool:
+        if self.base_model_idx not in self.projector_dict:
+            return False
+        for sources in self.projector_dict[self.base_model_idx].values():
+            for entry in sources.values():
+                for _, projector_idx in entry:
+                    if self._uses_target_hidden_states(self.projector_list[projector_idx]):
+                        return True
+        return False
+
     @staticmethod
-    def _get_source_hidden_for_layer(source_hidden_states, source_layer_idx: int, section_length: int) -> torch.Tensor:
-        if source_hidden_states is None:
-            raise ValueError("source_hidden_states is required for hidden-state C2C projection")
+    def _get_hidden_for_layer(hidden_states, layer_idx: int, section_length: int, name: str) -> torch.Tensor:
+        if hidden_states is None:
+            raise ValueError(f"{name} hidden_states is required for hidden-state C2C projection")
 
         # HF hidden_states[0] is the embedding / layer-0 input. That is the
-        # representation used to form layer 0 K/V, so source_layer_idx maps
-        # directly to hidden_states[source_layer_idx].
-        hidden_idx = min(source_layer_idx, len(source_hidden_states) - 1)
-        source_hidden = source_hidden_states[hidden_idx]
-        if source_hidden.size(1) != section_length:
-            if source_hidden.size(1) < section_length:
+        # representation used to form layer 0 K/V, so layer_idx maps directly
+        # to hidden_states[layer_idx].
+        hidden_idx = min(layer_idx, len(hidden_states) - 1)
+        hidden = hidden_states[hidden_idx]
+        if hidden.size(1) != section_length:
+            if hidden.size(1) < section_length:
                 raise ValueError(
-                    "Source hidden state is shorter than the projected section: "
-                    f"{source_hidden.size(1)} < {section_length}"
+                    f"{name} hidden state is shorter than the projected section: "
+                    f"{hidden.size(1)} < {section_length}"
                 )
-            source_hidden = source_hidden[:, -section_length:, :]
-        return source_hidden
+            hidden = hidden[:, -section_length:, :]
+        return hidden
 
     def _project_with_source(
         self,
         projector,
         source_model_layer_idx: int,
+        target_model_layer_idx: int,
         source_kv_cache,
         source_hidden_states,
+        target_hidden_states,
         target_kv,
         start: int,
         end: int,
     ):
         if self._uses_source_hidden_states(projector):
-            source_hidden = self._get_source_hidden_for_layer(
-                source_hidden_states=source_hidden_states,
-                source_layer_idx=source_model_layer_idx,
-                section_length=end - start,
+            source_hidden = self._get_hidden_for_layer(
+                source_hidden_states,
+                source_model_layer_idx,
+                end - start,
+                "source",
             )
+            if self._uses_target_hidden_states(projector):
+                target_hidden = self._get_hidden_for_layer(
+                    target_hidden_states,
+                    target_model_layer_idx,
+                    end - start,
+                    "target",
+                )
+                return projector.forward((source_hidden, target_hidden), target_kv)
             return projector.forward(source_hidden, target_kv)
 
         source_key_cache, source_value_cache = source_kv_cache[source_model_layer_idx]
@@ -87,15 +112,20 @@ class RosettaModel(BaseRosettaModel):
         base_kv_copy = clone_kv_cache(base_kv_cache)
         source_kv_copy = clone_kv_cache(source_kv_cache)
         new_length = input_ids.shape[1]
+        target_requires_hidden = self._target_requires_hidden_states()
 
-        base_output_kv_cache = self.model_list[self.base_model_idx].forward(
+        base_output = self.model_list[self.base_model_idx].forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=base_kv_copy,
             labels=None,
             use_cache=True,
-        ).past_key_values
+            output_hidden_states=target_requires_hidden,
+            return_dict=True,
+        )
+        base_output_kv_cache = base_output.past_key_values
+        target_hidden_states = base_output.hidden_states if target_requires_hidden else None
 
         source_requires_hidden = self._source_requires_hidden_states(source_model_idx)
         source_output = self.model_list[source_model_idx].forward(
@@ -124,8 +154,10 @@ class RosettaModel(BaseRosettaModel):
                 projected_key, projected_value = self._project_with_source(
                     projector=projector,
                     source_model_layer_idx=source_model_layer_idx,
+                    target_model_layer_idx=target_layer_idx,
                     source_kv_cache=source_output_kv_cache,
                     source_hidden_states=source_hidden_states,
+                    target_hidden_states=target_hidden_states,
                     target_kv=new_base_kv_cache,
                     start=base_key_cache.size(2) - new_length,
                     end=base_key_cache.size(2),
@@ -184,6 +216,7 @@ class RosettaModel(BaseRosettaModel):
 
         curr_base_kv_cache = past_key_values
         output = None
+        target_requires_hidden = self._target_requires_hidden_states()
 
         for i in range(num_sections):
             start = section_starts[i]
@@ -231,7 +264,7 @@ class RosettaModel(BaseRosettaModel):
                 labels=prefill_labels,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=bool(output_hidden_states) or target_requires_hidden,
                 *args,
                 **kwargs,
             )
@@ -244,6 +277,7 @@ class RosettaModel(BaseRosettaModel):
 
             curr_base_kv_cache = output.past_key_values
             source_hidden_states_dict = {}
+            target_hidden_states = output.hidden_states if target_requires_hidden else None
 
             for source_model_idx in range(1, len(self.model_list)):
                 if self.base_model_idx not in self.kv_cache_dict:
@@ -316,8 +350,10 @@ class RosettaModel(BaseRosettaModel):
                                 projected_key, projected_value = self._project_with_source(
                                     projector=projector,
                                     source_model_layer_idx=source_model_layer_idx,
+                                    target_model_layer_idx=target_layer_idx,
                                     source_kv_cache=self.kv_cache_dict[self.base_model_idx][source_model_idx],
                                     source_hidden_states=source_hidden_states_dict.get(source_model_idx),
+                                    target_hidden_states=target_hidden_states,
                                     target_kv=new_base_kv_cache,
                                     start=start,
                                     end=end,

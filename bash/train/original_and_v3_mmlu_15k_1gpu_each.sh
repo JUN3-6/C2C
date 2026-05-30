@@ -19,7 +19,7 @@ original_pid=$!
 
 CUDA_VISIBLE_DEVICES="${V3_GPU}" torchrun --nproc_per_node=1 --master_port="${V3_PORT}" \
     script/train/SFT_train_v3.py --config "${V3_CONFIG}" \
-    > "${LOG_DIR}/v3_hidden_gpu${V3_GPU}.log" 2>&1 &
+    > "${LOG_DIR}/v3_hidden_concat_gpu${V3_GPU}.log" 2>&1 &
 v3_pid=$!
 
 cleanup() {
@@ -28,10 +28,10 @@ cleanup() {
 trap cleanup INT TERM
 
 echo "Original C2C PID ${original_pid} on GPU ${ORIGINAL_GPU}"
-echo "V3 hidden C2C PID ${v3_pid} on GPU ${V3_GPU}"
+echo "V3 hidden-concat C2C PID ${v3_pid} on GPU ${V3_GPU}"
 echo "Logs:"
 echo "  ${LOG_DIR}/original_c2c_gpu${ORIGINAL_GPU}.log"
-echo "  ${LOG_DIR}/v3_hidden_gpu${V3_GPU}.log"
+echo "  ${LOG_DIR}/v3_hidden_concat_gpu${V3_GPU}.log"
 
 set +e
 wait "${original_pid}"

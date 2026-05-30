@@ -6,10 +6,11 @@
         "alignment_strategy": "first",
         "include_response": false,
         "projector": {
-            "type": "C2CHiddenStateProjector",
+            "type": "C2CHiddenConcatProjectorV3",
             "params": {
                 "source_hidden_dim": 896,
-                "hidden_dim": 896,
+                "target_hidden_dim": 1024,
+                "hidden_dim": 1024,
                 "intermediate_dim": 1024,
                 "num_layers": 3,
                 "dropout": 0.1,
@@ -36,14 +37,14 @@
         "seed": 42
     },
     "output": {
-        "output_dir": "local/checkpoints/0.6+0.5B_C2C_v3_hidden_MMLU_15k_2gpu",
+        "output_dir": "local/checkpoints/0.6+0.5B_C2C_v3_hidden_concat_MMLU_15k_2gpu",
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
             "project": "C2C",
             "mode": "online",
             "entity": "june6-hanyang-university",
-            "run_name": "0.6+0.5B_C2C_v3_hidden_MMLU_15k_2gpu"
+            "run_name": "0.6+0.5B_C2C_v3_hidden_concat_MMLU_15k_2gpu"
         }
     },
     "data": {
