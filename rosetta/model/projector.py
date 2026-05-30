@@ -1355,6 +1355,81 @@ class C2CKVAlignmentProjector(Projector):
 register_model("KVAlignmentProjector")(C2CKVAlignmentProjector)
 register_model("LatentSpaceKVAlignmentProjector")(C2CKVAlignmentProjector)
 
+@register_model
+@capture_init_args
+class C2CKVAlignmentNoResidualProjector(C2CKVAlignmentProjector):
+    """
+    KV alignment projector without receiver residual preservation.
+
+    This keeps the same source-to-shared and shared-to-target adapters as
+    C2CKVAlignmentProjector, but writes the aligned KV directly:
+        output = gate * scalar * projected_kv
+    """
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, Nt, Dt = target_key.shape
+        if Nt != N:
+            raise ValueError(f"source and target KV lengths must match; got {N} and {Nt}")
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+
+        key_shared = self.act(self.key_to_shared(self.key_to_shared_norm(source_key_flat.to(dtype=target_key.dtype))))
+        value_shared = self.act(self.value_to_shared(self.value_to_shared_norm(source_value_flat.to(dtype=target_value.dtype))))
+
+        key_shared = self.shared_mixer(key_shared)
+        value_shared = self.shared_mixer(value_shared)
+
+        key_delta_flat = self.key_from_shared(self.key_from_shared_norm(key_shared))
+        value_delta_flat = self.value_from_shared(self.value_from_shared_norm(value_shared))
+        projected_key = key_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        projected_value = value_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+
+        key_scalar = self.key_scalar_head(key_shared).permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = self.value_scalar_head(value_shared).permute(0, 2, 1).unsqueeze(-1)
+
+        key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
+        value_gate_logit = self.value_gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=value_gate_logit.device, dtype=value_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
+        else:
+            key_gate = (key_gate_logit > 0).float()
+            value_gate = (value_gate_logit > 0).float()
+
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        output_key = key_gate * norm_key_scalar * projected_key
+        output_value = value_gate * norm_value_scalar * projected_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("KVAlignmentNoResidualProjector")(C2CKVAlignmentNoResidualProjector)
+register_model("LatentSpaceKVAlignmentNoResidualProjector")(C2CKVAlignmentNoResidualProjector)
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
