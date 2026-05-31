@@ -1357,6 +1357,299 @@ register_model("LatentSpaceKVAlignmentProjector")(C2CKVAlignmentProjector)
 
 @register_model
 @capture_init_args
+class C2CKVAlignmentCrossAttentionProjector(Projector):
+    """
+    Receiver-conditioned KV alignment through a compact shared latent memory.
+
+    This keeps the C2C one-layer-at-a-time projector interface, but adds the
+    cross-attention adapter structure from latent KV alignment:
+
+        source KV -> shared source tokens
+        learned latent queries cross-attend to source tokens
+        receiver KV queries cross-attend to the compact latent memory
+        aligned tokens -> target KV delta -> gated receiver residual
+
+    The compact latent memory avoids full N x N source/receiver attention.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        shared_dim: int = 512,
+        intermediate_dim: int = 1024,
+        num_layers: int = 2,
+        num_latents: int = 32,
+        num_attention_heads: int = 8,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 400,
+        dtype: torch.dtype = torch.float32,
+        gate_init: float = 0.0,
+        zero_init: bool = False,
+        up_proj_scale: Optional[float] = None,
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if num_latents < 1:
+            raise ValueError("num_latents must be >= 1")
+        if shared_dim % num_attention_heads != 0:
+            raise ValueError("shared_dim must be divisible by num_attention_heads")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.shared_dim = shared_dim
+        self.intermediate_dim = intermediate_dim
+        self.num_latents = num_latents
+        self.num_attention_heads = num_attention_heads
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.key_source_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.value_source_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.key_source_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.value_source_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+
+        self.key_target_norm = nn.LayerNorm(target_flat_dim, dtype=dtype)
+        self.value_target_norm = nn.LayerNorm(target_flat_dim, dtype=dtype)
+        self.key_target_query = nn.Linear(target_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.value_target_query = nn.Linear(target_flat_dim, shared_dim, bias=True, dtype=dtype)
+
+        self.key_latents = nn.Parameter(torch.empty(num_latents, shared_dim, dtype=dtype))
+        self.value_latents = nn.Parameter(torch.empty(num_latents, shared_dim, dtype=dtype))
+        nn.init.normal_(self.key_latents, mean=0.0, std=0.02)
+        nn.init.normal_(self.value_latents, mean=0.0, std=0.02)
+
+        self.key_compress_attn = nn.MultiheadAttention(
+            shared_dim,
+            num_attention_heads,
+            dropout=dropout,
+            batch_first=True,
+            dtype=dtype,
+        )
+        self.value_compress_attn = nn.MultiheadAttention(
+            shared_dim,
+            num_attention_heads,
+            dropout=dropout,
+            batch_first=True,
+            dtype=dtype,
+        )
+        self.key_read_attn = nn.MultiheadAttention(
+            shared_dim,
+            num_attention_heads,
+            dropout=dropout,
+            batch_first=True,
+            dtype=dtype,
+        )
+        self.value_read_attn = nn.MultiheadAttention(
+            shared_dim,
+            num_attention_heads,
+            dropout=dropout,
+            batch_first=True,
+            dtype=dtype,
+        )
+
+        self.key_attn_drop = nn.Dropout(dropout)
+        self.value_attn_drop = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+        self.key_mixer = RegularMLP(
+            hidden_dim=shared_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.value_mixer = RegularMLP(
+            hidden_dim=shared_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            dtype=dtype,
+        )
+
+        self.key_out_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.value_out_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.key_out = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+        self.value_out = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+
+        if zero_init:
+            nn.init.zeros_(self.key_out.weight)
+            nn.init.zeros_(self.key_out.bias)
+            nn.init.zeros_(self.value_out.weight)
+            nn.init.zeros_(self.value_out.bias)
+        elif up_proj_scale is not None:
+            nn.init.kaiming_uniform_(self.key_out.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.value_out.weight, a=math.sqrt(5))
+            self.key_out.weight.data.mul_(up_proj_scale)
+            self.value_out.weight.data.mul_(up_proj_scale)
+            if self.key_out.bias is not None:
+                nn.init.zeros_(self.key_out.bias)
+            if self.value_out.bias is not None:
+                nn.init.zeros_(self.value_out.bias)
+
+        self.key_scalar_head = nn.Linear(shared_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(shared_dim, target_num_heads, dtype=dtype)
+
+        self.key_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(gate_init, dtype=dtype))
+        self.use_gumbel = True
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+        self.scalar_temperature = 1.0
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def _align_path(
+        self,
+        source_flat: Tensor,
+        target_flat: Tensor,
+        source_norm: nn.LayerNorm,
+        source_proj: nn.Linear,
+        target_norm: nn.LayerNorm,
+        target_query: nn.Linear,
+        latent_tokens: Tensor,
+        compress_attn: nn.MultiheadAttention,
+        read_attn: nn.MultiheadAttention,
+        attn_drop: nn.Dropout,
+        mixer: RegularMLP,
+        out_norm: nn.LayerNorm,
+        out_proj: nn.Linear,
+        scalar_head: nn.Linear,
+    ) -> Tuple[Tensor, Tensor]:
+        B = source_flat.shape[0]
+
+        source_tokens = self.act(source_proj(source_norm(source_flat.to(dtype=target_flat.dtype))))
+        receiver_queries = self.act(target_query(target_norm(target_flat)))
+
+        latents = latent_tokens.unsqueeze(0).expand(B, -1, -1)
+        latent_update, _ = compress_attn(
+            query=latents,
+            key=source_tokens,
+            value=source_tokens,
+            need_weights=False,
+        )
+        latents = latents + attn_drop(latent_update)
+
+        read_update, _ = read_attn(
+            query=receiver_queries,
+            key=latents,
+            value=latents,
+            need_weights=False,
+        )
+        aligned = receiver_queries + attn_drop(read_update)
+        aligned = mixer(aligned)
+
+        delta_flat = out_proj(out_norm(aligned))
+        scalar = scalar_head(aligned)
+        return delta_flat, scalar
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, Nt, Dt = target_key.shape
+        if Nt != N:
+            raise ValueError(f"source and target KV lengths must match; got {N} and {Nt}")
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+        target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+
+        key_delta_flat, key_scalar = self._align_path(
+            source_key_flat,
+            target_key_flat,
+            self.key_source_norm,
+            self.key_source_proj,
+            self.key_target_norm,
+            self.key_target_query,
+            self.key_latents,
+            self.key_compress_attn,
+            self.key_read_attn,
+            self.key_attn_drop,
+            self.key_mixer,
+            self.key_out_norm,
+            self.key_out,
+            self.key_scalar_head,
+        )
+        value_delta_flat, value_scalar = self._align_path(
+            source_value_flat,
+            target_value_flat,
+            self.value_source_norm,
+            self.value_source_proj,
+            self.value_target_norm,
+            self.value_target_query,
+            self.value_latents,
+            self.value_compress_attn,
+            self.value_read_attn,
+            self.value_attn_drop,
+            self.value_mixer,
+            self.value_out_norm,
+            self.value_out,
+            self.value_scalar_head,
+        )
+
+        projected_key = key_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        projected_value = value_delta_flat.view(B, N, Ht, Dt).transpose(1, 2)
+
+        key_scalar = key_scalar.permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = value_scalar.permute(0, 2, 1).unsqueeze(-1)
+
+        key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
+        value_gate_logit = self.value_gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=value_gate_logit.device, dtype=value_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
+        else:
+            key_gate = (key_gate_logit > 0).float()
+            value_gate = (value_gate_logit > 0).float()
+
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        output_key = target_key + key_gate * norm_key_scalar * projected_key
+        output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("KVAlignmentCrossAttentionProjector")(C2CKVAlignmentCrossAttentionProjector)
+register_model("LatentSpaceKVAlignmentCrossAttentionProjector")(C2CKVAlignmentCrossAttentionProjector)
+
+@register_model
+@capture_init_args
 class C2CKVAlignmentNoResidualProjector(C2CKVAlignmentProjector):
     """
     KV alignment projector without receiver residual preservation.
