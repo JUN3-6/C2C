@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+export CUDA_VISIBLE_DEVICES=1
 MASTER_PORT=${MASTER_PORT:-29521}
 LOG_DIR=${LOG_DIR:-local/logs/kv_align_crossattn_1gpu}
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
