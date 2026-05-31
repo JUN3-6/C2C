@@ -1532,8 +1532,14 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
     ) -> Tuple[Tensor, Tensor]:
         B = source_flat.shape[0]
 
-        source_tokens = self.act(source_proj(source_norm(source_flat.to(dtype=target_flat.dtype))))
-        receiver_queries = self.act(target_query(target_norm(target_flat)))
+        # The C2C wrapper passes KV-cache slices, then updates those cache
+        # tensors in-place after the projector returns. Clone here so LayerNorm
+        # backward does not depend on a view whose storage is later modified.
+        source_input = source_flat.to(dtype=target_flat.dtype).clone()
+        target_input = target_flat.clone()
+
+        source_tokens = self.act(source_proj(source_norm(source_input)))
+        receiver_queries = self.act(target_query(target_norm(target_input)))
 
         latents = latent_tokens.unsqueeze(0).expand(B, -1, -1)
         latent_update, _ = compress_attn(
