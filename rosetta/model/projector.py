@@ -1430,6 +1430,117 @@ class C2CKVAlignmentNoResidualProjector(C2CKVAlignmentProjector):
 register_model("KVAlignmentNoResidualProjector")(C2CKVAlignmentNoResidualProjector)
 register_model("LatentSpaceKVAlignmentNoResidualProjector")(C2CKVAlignmentNoResidualProjector)
 
+@register_model
+@capture_init_args
+class C2CKVAlignmentFusionProjector(Projector):
+    """
+    Fusion of original C2C projection and KV alignment projection.
+
+    Both branches receive the same C2C wrapper inputs. Each branch computes its
+    own residual update, then the updates are summed onto the receiver KV:
+        output = target + c2c_scale * (c2c_out - target)
+                        + align_scale * (align_out - target)
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        c2c_hidden_dim: int = 1024,
+        c2c_intermediate_dim: int = 1024,
+        c2c_num_layers: int = 3,
+        align_shared_dim: int = 1024,
+        align_intermediate_dim: int = 1024,
+        align_num_layers: int = 2,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        c2c_anneal_steps: int = 1929,
+        align_anneal_steps: int = 400,
+        c2c_residual_scale: float = 1.0,
+        align_residual_scale: float = 1.0,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.c2c_residual_scale = c2c_residual_scale
+        self.align_residual_scale = align_residual_scale
+
+        self.c2c_branch = C2CProjector(
+            source_dim=source_dim,
+            target_dim=target_dim,
+            source_num_heads=source_num_heads,
+            target_num_heads=target_num_heads,
+            intermediate_dim=c2c_intermediate_dim,
+            hidden_dim=c2c_hidden_dim,
+            num_layers=c2c_num_layers,
+            dropout=dropout,
+            initial_temperature=initial_temperature,
+            final_temperature=final_temperature,
+            anneal_steps=c2c_anneal_steps,
+            dtype=dtype,
+        )
+        self.align_branch = C2CKVAlignmentProjector(
+            source_dim=source_dim,
+            target_dim=target_dim,
+            source_num_heads=source_num_heads,
+            target_num_heads=target_num_heads,
+            shared_dim=align_shared_dim,
+            intermediate_dim=align_intermediate_dim,
+            num_layers=align_num_layers,
+            dropout=dropout,
+            initial_temperature=initial_temperature,
+            final_temperature=final_temperature,
+            anneal_steps=align_anneal_steps,
+            dtype=dtype,
+        )
+
+    def update_temperature(self, step: int):
+        self.c2c_branch.update_temperature(step)
+        self.align_branch.update_temperature(step)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        target_key, target_value = target_kv
+
+        c2c_key, c2c_value = self.c2c_branch(source_kv, target_kv, position_ids=position_ids, max_pos=max_pos)
+        align_key, align_value = self.align_branch(source_kv, target_kv, position_ids=position_ids, max_pos=max_pos)
+
+        output_key = (
+            target_key
+            + self.c2c_residual_scale * (c2c_key - target_key)
+            + self.align_residual_scale * (align_key - target_key)
+        )
+        output_value = (
+            target_value
+            + self.c2c_residual_scale * (c2c_value - target_value)
+            + self.align_residual_scale * (align_value - target_value)
+        )
+
+        try:
+            self.last_c2c_key_gate_logit = getattr(self.c2c_branch, "last_key_gate_logit", None)
+            self.last_c2c_value_gate_logit = getattr(self.c2c_branch, "last_value_gate_logit", None)
+            self.last_align_key_gate_logit = getattr(self.align_branch, "last_key_gate_logit", None)
+            self.last_align_value_gate_logit = getattr(self.align_branch, "last_value_gate_logit", None)
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("C2CKVAlignFusionProjector")(C2CKVAlignmentFusionProjector)
+register_model("KVAlignmentFusionProjector")(C2CKVAlignmentFusionProjector)
+
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)
 
