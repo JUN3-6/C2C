@@ -351,6 +351,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
                 extra_projector_params = {
                     "source_num_layers": llm_num_layers,
                     "target_num_layers": slm_num_layers,
+                    "source_hidden_dim": teacher_model.config.hidden_size,
                 }
             projector = create_projector(
                 projector_config["type"],

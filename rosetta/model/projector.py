@@ -2019,6 +2019,7 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         target_num_heads: int = 1,
         source_num_layers: int = 1,
         target_num_layers: int = 1,
+        source_hidden_dim: Optional[int] = None,
         shared_dim: int = 672,
         adapter_dim: int = 32,
         intermediate_dim: int = 128,
@@ -2142,6 +2143,323 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
 register_model("SharedSpaceKVAlignmentProjector")(C2CSharedSpaceKVAlignmentProjector)
 register_model("KVAlignmentSharedSpaceProjector")(C2CSharedSpaceKVAlignmentProjector)
 register_model("LatentSpaceKVAlignmentSharedProjector")(C2CSharedSpaceKVAlignmentProjector)
+
+
+class _KVMemoryCrossAttentionStack(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.attn = nn.ModuleList([
+            nn.MultiheadAttention(
+                hidden_dim,
+                num_attention_heads,
+                dropout=dropout,
+                batch_first=True,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.ModuleList([nn.LayerNorm(hidden_dim, dtype=dtype) for _ in range(num_layers)])
+        self.ffn = nn.ModuleList([
+            StandardFFNLayer(hidden_dim, intermediate_dim, dropout=dropout, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, query_seed: Tensor, memory_key: Tensor, memory_value: Tensor) -> Tensor:
+        hidden = query_seed
+        outputs = []
+        for layer_idx, (attn, norm, ffn) in enumerate(zip(self.attn, self.norm, self.ffn)):
+            attn_out, _ = attn(
+                query=hidden,
+                key=memory_key[:, :, layer_idx, :],
+                value=memory_value[:, :, layer_idx, :],
+                need_weights=False,
+            )
+            hidden = norm(hidden + self.drop(attn_out))
+            hidden = ffn(hidden)
+            outputs.append(hidden)
+        return torch.stack(outputs, dim=2)
+
+
+class _KVToSharedHiddenSeedAdapter(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        local_dim: int,
+        source_hidden_dim: int,
+        shared_dim: int,
+        adapter_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.local_dim = local_dim
+        self.query_norm = nn.LayerNorm(source_hidden_dim, dtype=dtype)
+        self.query_proj = nn.Linear(source_hidden_dim, adapter_dim, dtype=dtype)
+        self.key_memory_norm = nn.LayerNorm(local_dim, dtype=dtype)
+        self.value_memory_norm = nn.LayerNorm(local_dim, dtype=dtype)
+        self.key_memory_proj = nn.Linear(local_dim, adapter_dim, dtype=dtype)
+        self.value_memory_proj = nn.Linear(local_dim, adapter_dim, dtype=dtype)
+        self.mixer = _KVMemoryCrossAttentionStack(
+            num_layers,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.output_norm = nn.LayerNorm(num_layers * adapter_dim, dtype=dtype)
+        self.output_proj = nn.Linear(num_layers * adapter_dim, shared_dim, dtype=dtype)
+        self.act = nn.GELU()
+
+    def forward(
+        self,
+        local_key_cache: Tensor,
+        local_value_cache: Tensor,
+        source_hidden_states: Tensor,
+    ) -> Tensor:
+        source_hidden_states = source_hidden_states.to(dtype=local_key_cache.dtype)
+        query_seed = self.act(self.query_proj(self.query_norm(source_hidden_states)))
+        memory_key = self.act(self.key_memory_proj(self.key_memory_norm(local_key_cache)))
+        memory_value = self.act(self.value_memory_proj(self.value_memory_norm(local_value_cache)))
+        mixed = self.mixer(query_seed, memory_key, memory_value)
+        mixed = mixed.reshape(mixed.size(0), mixed.size(1), self.num_layers * mixed.size(-1))
+        return self.output_proj(self.output_norm(mixed))
+
+
+class _SharedToLocalHiddenSeedAdapter(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        local_dim: int,
+        source_hidden_dim: int,
+        shared_dim: int,
+        adapter_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+        output_mode: Literal["concat", "per_layer"] = "concat",
+    ):
+        super().__init__()
+        if shared_dim % num_layers != 0:
+            raise ValueError(f"shared_dim ({shared_dim}) must be divisible by num_layers ({num_layers})")
+        if output_mode not in {"concat", "per_layer"}:
+            raise ValueError(f"output_mode must be 'concat' or 'per_layer', got {output_mode}")
+
+        self.num_layers = num_layers
+        self.local_dim = local_dim
+        self.shared_layer_dim = shared_dim // num_layers
+        self.output_mode = output_mode
+
+        self.query_norm = nn.LayerNorm(source_hidden_dim, dtype=dtype)
+        self.query_proj = nn.Linear(source_hidden_dim, adapter_dim, dtype=dtype)
+        self.key_memory_norm = nn.LayerNorm(self.shared_layer_dim, dtype=dtype)
+        self.value_memory_norm = nn.LayerNorm(self.shared_layer_dim, dtype=dtype)
+        self.key_memory_proj = nn.Linear(self.shared_layer_dim, adapter_dim, dtype=dtype)
+        self.value_memory_proj = nn.Linear(self.shared_layer_dim, adapter_dim, dtype=dtype)
+        self.mixer = _KVMemoryCrossAttentionStack(
+            num_layers,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        if output_mode == "concat":
+            self.output_norm = nn.LayerNorm(num_layers * adapter_dim, dtype=dtype)
+            self.output_proj = nn.Linear(num_layers * adapter_dim, num_layers * local_dim, dtype=dtype)
+        else:
+            self.output_norm = nn.LayerNorm(adapter_dim, dtype=dtype)
+            self.output_proj = nn.Linear(adapter_dim, local_dim, dtype=dtype)
+        self.act = nn.GELU()
+
+    @staticmethod
+    def _last_valid_hidden(source_hidden_states: Tensor, source_attention_mask: Optional[Tensor]) -> Tensor:
+        if source_attention_mask is None:
+            return source_hidden_states[:, -1, :]
+        lengths = source_attention_mask.to(device=source_hidden_states.device).long().sum(dim=1).clamp(min=1)
+        batch_idx = torch.arange(source_hidden_states.size(0), device=source_hidden_states.device)
+        return source_hidden_states[batch_idx, lengths - 1, :]
+
+    def forward(
+        self,
+        shared_cache: Tensor,
+        source_hidden_states: Tensor,
+        source_attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        B, S, _ = shared_cache.shape
+        layer_input = shared_cache.view(B, S, self.num_layers, self.shared_layer_dim)
+        seed_hidden = self._last_valid_hidden(source_hidden_states, source_attention_mask).to(dtype=shared_cache.dtype)
+        query_seed = self.act(self.query_proj(self.query_norm(seed_hidden))).unsqueeze(1).expand(B, S, -1)
+        memory_key = self.act(self.key_memory_proj(self.key_memory_norm(layer_input)))
+        memory_value = self.act(self.value_memory_proj(self.value_memory_norm(layer_input)))
+        mixed = self.mixer(query_seed, memory_key, memory_value)
+
+        if self.output_mode == "concat":
+            flat = mixed.reshape(B, S, self.num_layers * mixed.size(-1))
+            local = self.output_proj(self.output_norm(flat))
+            return local.view(B, S, self.num_layers, self.local_dim)
+
+        return self.output_proj(self.output_norm(mixed))
+
+
+@register_model
+@capture_init_args
+class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
+    """
+    Full-cache shared-space KV translator using sharer hidden states as query seeds.
+
+    Source -> shared:
+        query seed: sharer final hidden state for each token
+        memory key/value: projections of the sharer's original K/V caches
+
+    Shared -> target:
+        first query seed: sharer prompt last-token final hidden state
+        memory key/value: separate projections of the shared latent
+    """
+
+    is_full_cache_projector = True
+    requires_source_hidden_states = True
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        source_num_layers: int = 1,
+        target_num_layers: int = 1,
+        source_hidden_dim: int = 1,
+        shared_dim: int = 672,
+        adapter_dim: int = 32,
+        intermediate_dim: int = 128,
+        num_attention_heads: int = 4,
+        dropout: float = 0.1,
+        output_mode: Literal["concat", "per_layer"] = "concat",
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        if adapter_dim % num_attention_heads != 0:
+            raise ValueError("adapter_dim must be divisible by num_attention_heads")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.source_num_layers = source_num_layers
+        self.target_num_layers = target_num_layers
+        self.source_hidden_dim = source_hidden_dim
+        self.shared_dim = shared_dim
+        self.adapter_dim = adapter_dim
+        self.output_mode = output_mode
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.source_to_shared = _KVToSharedHiddenSeedAdapter(
+            source_num_layers,
+            source_flat_dim,
+            source_hidden_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.key_shared_to_target = _SharedToLocalHiddenSeedAdapter(
+            target_num_layers,
+            target_flat_dim,
+            source_hidden_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+        self.value_shared_to_target = _SharedToLocalHiddenSeedAdapter(
+            target_num_layers,
+            target_flat_dim,
+            source_hidden_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+
+    @staticmethod
+    def _cache_layers_to_local(layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> Tensor:
+        stream_layers = []
+        for key, value in layers:
+            tensor = key if stream_idx == 0 else value
+            B, H, S, D = tensor.shape
+            stream_layers.append(tensor.transpose(1, 2).contiguous().view(B, S, H * D))
+        return torch.stack(stream_layers, dim=2)
+
+    @staticmethod
+    def _local_to_cache_layers(local_cache: Tensor, target_layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> List[Tensor]:
+        outputs = []
+        for layer_idx, (target_key, target_value) in enumerate(target_layers):
+            target = target_key if stream_idx == 0 else target_value
+            B, H, S, D = target.shape
+            layer_flat = local_cache[:, :, layer_idx, :].to(dtype=target.dtype)
+            outputs.append(layer_flat.view(B, S, H, D).transpose(1, 2).contiguous())
+        return outputs
+
+    def forward_cache(
+        self,
+        source_layers: List[Tuple[Tensor, Tensor]],
+        target_layers: List[Tuple[Tensor, Tensor]],
+        source_hidden_states: Optional[Tensor] = None,
+        source_attention_mask: Optional[Tensor] = None,
+    ) -> List[Tuple[Tensor, Tensor]]:
+        if source_hidden_states is None:
+            raise ValueError("source_hidden_states is required for C2CHiddenSeedSharedSpaceKVAlignmentProjector")
+        if len(source_layers) != self.source_num_layers:
+            raise ValueError(f"expected {self.source_num_layers} source layers, got {len(source_layers)}")
+        if len(target_layers) != self.target_num_layers:
+            raise ValueError(f"expected {self.target_num_layers} target layers, got {len(target_layers)}")
+
+        source_key_local = self._cache_layers_to_local(source_layers, stream_idx=0)
+        source_value_local = self._cache_layers_to_local(source_layers, stream_idx=1)
+        shared = self.source_to_shared(source_key_local, source_value_local, source_hidden_states)
+
+        target_key_local = self.key_shared_to_target(shared, source_hidden_states, source_attention_mask)
+        target_value_local = self.value_shared_to_target(shared, source_hidden_states, source_attention_mask)
+        target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
+        target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
+        return list(zip(target_keys, target_values))
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        raise NotImplementedError("C2CHiddenSeedSharedSpaceKVAlignmentProjector requires forward_cache with all layers")
+
+
+register_model("HiddenSeedSharedSpaceKVAlignmentProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentHiddenSeedSharedSpaceProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentHiddenSeedProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
 
 
 @register_model

@@ -507,6 +507,8 @@ class RosettaModel(nn.Module):
                 self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = clone_kv_cache(output.past_key_values)
 
                 curr_base_kv_cache: DynamicCache = output.past_key_values
+                source_hidden_state_dict = {}
+                source_attention_mask_dict = {}
             
                 for source_model_idx in range(1, len(self.model_list)):
                     if self.base_model_idx not in self.kv_cache_dict:
@@ -520,14 +522,21 @@ class RosettaModel(nn.Module):
                         source_attention_mask = attention_mask[source_model_idx] if attention_mask is not None else None
                         source_prefill_input_ids = source_input_ids[:, start:end] if source_input_ids is not None else None
                         source_prefill_attention_mask = source_attention_mask[:, :end] if source_attention_mask is not None else None
+                        source_section_attention_mask = source_attention_mask[:, start:end] if source_attention_mask is not None else None
                     else:
                         # Backward compatibility: use same input for all models
                         source_prefill_input_ids = prefill_input_ids
                         source_prefill_attention_mask = prefill_attention_mask
+                        source_section_attention_mask = base_attention_mask[:, start:end] if base_attention_mask is not None else None
 
                     model = self.model_list[source_model_idx]
                     was_training = model.training
                     had_gc = getattr(model, "is_gradient_checkpointing", False)
+                    source_projector = self.get_full_cache_projector(source_model_idx)
+                    need_source_hidden_states = bool(
+                        source_projector is not None
+                        and getattr(source_projector, "requires_source_hidden_states", False)
+                    )
 
                     try:
                         if was_training:
@@ -542,9 +551,13 @@ class RosettaModel(nn.Module):
                                 position_ids=prefill_position_ids,
                                 past_key_values=self.kv_cache_dict[self.base_model_idx][source_model_idx],
                                 use_cache=True,
+                                output_hidden_states=need_source_hidden_states,
                                 return_dict=True,
                             )
                             curr_source_kv_cache = out.past_key_values
+                            if need_source_hidden_states:
+                                source_hidden_state_dict[source_model_idx] = out.hidden_states[-1]
+                                source_attention_mask_dict[source_model_idx] = source_section_attention_mask
                     finally:
                         if had_gc:
                             model.gradient_checkpointing_enable()
@@ -586,7 +599,17 @@ class RosettaModel(nn.Module):
                                     )
                                     for target_key, target_value in _iter_kv_layers(curr_base_kv_cache)
                                 ]
-                                projected_layers = full_cache_projector.forward_cache(source_layers, target_layers)
+                                forward_cache_kwargs = {}
+                                if getattr(full_cache_projector, "requires_source_hidden_states", False):
+                                    forward_cache_kwargs = {
+                                        "source_hidden_states": source_hidden_state_dict.get(source_model_idx),
+                                        "source_attention_mask": source_attention_mask_dict.get(source_model_idx),
+                                    }
+                                projected_layers = full_cache_projector.forward_cache(
+                                    source_layers,
+                                    target_layers,
+                                    **forward_cache_kwargs,
+                                )
                                 for target_layer_idx, (projected_key, projected_value) in enumerate(projected_layers):
                                     _set_kv_cache_slice(
                                         curr_base_kv_cache,
