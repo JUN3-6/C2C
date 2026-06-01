@@ -26,7 +26,6 @@
         "scheduler_type": "linear",
         "warmup_ratio": 0.1,
         "max_grad_norm": 1.0,
-        "loss_type": "paper_suffix_lm",
         "gradient_accumulation_steps": 64,
         "per_device_train_batch_size": 1,
         "num_processes": 1,
