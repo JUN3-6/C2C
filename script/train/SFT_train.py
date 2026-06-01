@@ -5,6 +5,7 @@ Use SFT trainer to train rosetta model
 import gc
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import random
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
@@ -397,7 +398,45 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         return rosetta_model, slm_tokenizer, aligner, llm_tokenizer
 
         
-def train_step(model: nn.Module, batch: Dict[str, Any], tokenizer: AutoTokenizer, max_length: int, device: str, training_mode: str):
+def _zero_trainable_loss(model: nn.Module) -> torch.Tensor:
+    anchor_param = next((p for p in model.parameters() if p.requires_grad), None)
+    if anchor_param is None:
+        return torch.tensor(0.0)
+    return anchor_param.float().sum() * 0.0
+
+
+def _paper_suffix_lm_loss(
+    logits: torch.Tensor,
+    suffix_input_ids: torch.Tensor,
+    suffix_attention_mask: Optional[torch.Tensor],
+    model: nn.Module,
+) -> torch.Tensor:
+    if logits.size(1) < 2 or suffix_input_ids.size(1) < 2:
+        return _zero_trainable_loss(model).to(logits.device)
+
+    shift_logits = logits[:, :-1, :].contiguous().float()
+    shift_labels = suffix_input_ids[:, 1:].contiguous()
+    if suffix_attention_mask is None:
+        active = torch.ones_like(shift_labels, dtype=torch.bool)
+    else:
+        active = suffix_attention_mask[:, 1:].contiguous().bool()
+
+    active = active & (shift_labels != -100)
+    if not active.any():
+        return _zero_trainable_loss(model).to(logits.device)
+
+    return F.cross_entropy(shift_logits[active], shift_labels[active], reduction="mean")
+
+
+def train_step(
+    model: nn.Module,
+    batch: Dict[str, Any],
+    tokenizer: AutoTokenizer,
+    max_length: int,
+    device: str,
+    training_mode: str,
+    loss_type: str = "default",
+):
     """Single training step for both baseline and Rosetta models"""
     
     if training_mode == "baseline":
@@ -429,21 +468,27 @@ def train_step(model: nn.Module, batch: Dict[str, Any], tokenizer: AutoTokenizer
         kv_cache_index = [x.to(device) for x in batch["kv_cache_index"]]
         
         # Forward pass for Rosetta model
+        model_labels = None if loss_type == "paper_suffix_lm" else labels
         outputs = model.forward(
             kv_cache_index=kv_cache_index,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            labels=labels,
+            labels=model_labels,
             use_cache=True
         )
-        
-        loss = outputs.loss
 
-        if loss is not None and not loss.requires_grad:
-            anchor_param = next((p for p in model.parameters() if p.requires_grad), None)
-            if anchor_param is not None:
-                loss = loss + anchor_param.float().sum() * 0.0
+        if loss_type == "paper_suffix_lm":
+            base_input_ids = input_ids[0] if isinstance(input_ids, list) else input_ids
+            base_attention_mask = attention_mask[0] if isinstance(attention_mask, list) else attention_mask
+            suffix_len = outputs.logits.size(1)
+            suffix_input_ids = base_input_ids[:, -suffix_len:]
+            suffix_attention_mask = base_attention_mask[:, -suffix_len:] if base_attention_mask is not None else None
+            loss = _paper_suffix_lm_loss(outputs.logits, suffix_input_ids, suffix_attention_mask, model)
+        else:
+            loss = outputs.loss
+            if loss is not None and not loss.requires_grad:
+                loss = loss + _zero_trainable_loss(model).to(loss.device)
 
         # Additional loss terms for Rosetta model
         # model_to_use = model.module if hasattr(model, "module") else model
@@ -456,7 +501,15 @@ def train_step(model: nn.Module, batch: Dict[str, Any], tokenizer: AutoTokenizer
     return loss
 
 
-def evaluate_model(model: nn.Module, eval_loader: DataLoader, tokenizer: AutoTokenizer, max_length: int, device: str, training_mode: str) -> float:
+def evaluate_model(
+    model: nn.Module,
+    eval_loader: DataLoader,
+    tokenizer: AutoTokenizer,
+    max_length: int,
+    device: str,
+    training_mode: str,
+    loss_type: str = "default",
+) -> float:
     """Evaluate the model and return average loss"""
     model.eval()
     eval_loss_total = 0.0
@@ -464,7 +517,7 @@ def evaluate_model(model: nn.Module, eval_loader: DataLoader, tokenizer: AutoTok
     
     with torch.no_grad():
         for eval_batch in eval_loader:
-            eval_loss = train_step(model, eval_batch, tokenizer, max_length, device, training_mode)
+            eval_loss = train_step(model, eval_batch, tokenizer, max_length, device, training_mode, loss_type=loss_type)
             eval_loss_total += eval_loss.item()
             num_batches += 1
     
@@ -658,6 +711,7 @@ def main():
 
     per_device_batch_size = training_config["per_device_train_batch_size"]
     grad_accum_steps = training_config.get("gradient_accumulation_steps", 1)
+    loss_type = training_config.get("loss_type", "default")
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -716,7 +770,7 @@ def main():
     # ------------------------------------------------------------------
     if args.eval_only:
         if distributed:
-            local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+            local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
             loss_tensor = torch.tensor([local_eval_loss], device=device, dtype=torch.float32)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             avg_eval_loss = loss_tensor.item()
@@ -727,7 +781,7 @@ def main():
                     "mode": "eval_only",
                 }, step=0)
         else:
-            eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+            eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
             print(f"Evaluation (eval_only) loss: {eval_loss:.4f}")
             if is_main_process:
                 wandb.log({
@@ -809,7 +863,7 @@ def main():
             sync_ctx = model.no_sync() if distributed and hasattr(model, "no_sync") and is_accum_step else contextlib.nullcontext()
 
             with sync_ctx:
-                loss = train_step(model, batch, main_tokenizer, training_config["max_length"], device, training_mode)
+                loss = train_step(model, batch, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
                 true_loss_value = loss.detach().item()
                 scaled_loss = loss / grad_accum_steps  # Gradient accumulation
                 scaled_loss.backward()
@@ -876,7 +930,7 @@ def main():
                 if want_eval:
                     if distributed:
                         # All ranks evaluate their shard and average
-                        local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+                        local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
                         loss_tensor = torch.tensor([local_eval_loss], device=device, dtype=torch.float32)
                         dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
                         avg_eval_loss = loss_tensor.item()
@@ -888,7 +942,7 @@ def main():
                                 "eval/epoch": fractional_epoch
                             }, step=global_step)
                     else:
-                        eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+                        eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
                         print(f"\nEvaluation loss at step {global_step}: {eval_loss:.4f}")
                         wandb.log({
                             "eval/loss": eval_loss,
@@ -942,7 +996,7 @@ def main():
         # ------------------------------------------------------------------
         if distributed:
             # Run eval on all ranks and average for deterministic sync
-            local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+            local_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
             loss_tensor = torch.tensor([local_eval_loss], device=device, dtype=torch.float32)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             avg_eval_loss = loss_tensor.item()
@@ -955,7 +1009,7 @@ def main():
                 }, step=global_step)
         else:
             print(f"Running end-of-epoch evaluation for epoch {epoch + 1}...")
-            avg_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode)
+            avg_eval_loss = evaluate_model(model, eval_loader, main_tokenizer, training_config["max_length"], device, training_mode, loss_type=loss_type)
             print(f"Epoch {epoch + 1} completed. Train loss: {avg_epoch_loss:.4f} | Eval loss: {avg_eval_loss:.4f}")
             wandb.log({
                 "eval/epoch_loss": avg_eval_loss,
