@@ -16,7 +16,8 @@
                 "dropout": 0.1,
                 "output_mode": "concat",
                 "use_target_residual": true,
-                "residual_scale": 1.0
+                "residual_scale": 1.0,
+                "residual_gate_init": -4.0
             }
         },
         "mapping": "full_cache"

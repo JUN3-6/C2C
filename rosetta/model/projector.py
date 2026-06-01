@@ -2029,6 +2029,7 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         output_mode: Literal["concat", "per_layer"] = "concat",
         use_target_residual: bool = False,
         residual_scale: float = 1.0,
+        residual_gate_init: float = -4.0,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -2046,6 +2047,11 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         self.output_mode = output_mode
         self.use_target_residual = use_target_residual
         self.residual_scale = residual_scale
+        self.residual_gate_init = residual_gate_init
+        self.residual_gate_logit = nn.Parameter(
+            torch.tensor(residual_gate_init, dtype=torch.float32),
+            requires_grad=use_target_residual,
+        )
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -2134,14 +2140,16 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
         target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
         if self.use_target_residual:
+            residual_gate = torch.sigmoid(self.residual_gate_logit)
             target_keys = [
-                base_key + self.residual_scale * projected_key
+                base_key + self.residual_scale * residual_gate.to(dtype=projected_key.dtype) * projected_key
                 for projected_key, (base_key, _) in zip(target_keys, target_layers)
             ]
             target_values = [
-                base_value + self.residual_scale * projected_value
+                base_value + self.residual_scale * residual_gate.to(dtype=projected_value.dtype) * projected_value
                 for projected_value, (_, base_value) in zip(target_values, target_layers)
             ]
+            self.last_residual_gate = float(residual_gate.detach().cpu().item())
         return list(zip(target_keys, target_values))
 
     def forward(
@@ -2367,6 +2375,7 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         output_mode: Literal["concat", "per_layer"] = "concat",
         use_target_residual: bool = False,
         residual_scale: float = 1.0,
+        residual_gate_init: float = -4.0,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -2385,6 +2394,11 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         self.output_mode = output_mode
         self.use_target_residual = use_target_residual
         self.residual_scale = residual_scale
+        self.residual_gate_init = residual_gate_init
+        self.residual_gate_logit = nn.Parameter(
+            torch.tensor(residual_gate_init, dtype=torch.float32),
+            requires_grad=use_target_residual,
+        )
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -2467,14 +2481,16 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
         target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
         if self.use_target_residual:
+            residual_gate = torch.sigmoid(self.residual_gate_logit)
             target_keys = [
-                base_key + self.residual_scale * projected_key
+                base_key + self.residual_scale * residual_gate.to(dtype=projected_key.dtype) * projected_key
                 for projected_key, (base_key, _) in zip(target_keys, target_layers)
             ]
             target_values = [
-                base_value + self.residual_scale * projected_value
+                base_value + self.residual_scale * residual_gate.to(dtype=projected_value.dtype) * projected_value
                 for projected_value, (_, base_value) in zip(target_values, target_layers)
             ]
+            self.last_residual_gate = float(residual_gate.detach().cpu().item())
         return list(zip(target_keys, target_values))
 
     def forward(
