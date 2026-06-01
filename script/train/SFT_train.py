@@ -487,8 +487,9 @@ def train_step(
             loss = _paper_suffix_lm_loss(outputs.logits, suffix_input_ids, suffix_attention_mask, model)
         else:
             loss = outputs.loss
-            if loss is not None and not loss.requires_grad:
-                loss = loss + _zero_trainable_loss(model).to(loss.device)
+
+        if loss is not None and not loss.requires_grad:
+            loss = loss + _zero_trainable_loss(model).to(loss.device)
 
         # Additional loss terms for Rosetta model
         # model_to_use = model.module if hasattr(model, "module") else model

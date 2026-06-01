@@ -32,15 +32,29 @@ def clone_kv_cache(kv_cache: DynamicCache) -> DynamicCache:
     return DynamicCache.from_legacy_cache(legacy_cache)
 
 
-def _set_kv_cache_slice(kv_cache: Cache, layer_idx: int, start: int, end: int, key: torch.Tensor, value: torch.Tensor) -> None:
+def _replace_cache_slice(cache_tensor: torch.Tensor, start: int, end: Optional[int], replacement: torch.Tensor) -> torch.Tensor:
+    seq_len = cache_tensor.size(-2)
+    start = seq_len + start if start < 0 else start
+    end = seq_len if end is None else (seq_len + end if end < 0 else end)
+    return torch.cat(
+        [
+            cache_tensor[:, :, :start, :],
+            replacement,
+            cache_tensor[:, :, end:, :],
+        ],
+        dim=-2,
+    )
+
+
+def _set_kv_cache_slice(kv_cache: Cache, layer_idx: int, start: int, end: Optional[int], key: torch.Tensor, value: torch.Tensor) -> None:
     if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
-        kv_cache.key_cache[layer_idx][:, :, start:end, :] = key
-        kv_cache.value_cache[layer_idx][:, :, start:end, :] = value
+        kv_cache.key_cache[layer_idx] = _replace_cache_slice(kv_cache.key_cache[layer_idx], start, end, key)
+        kv_cache.value_cache[layer_idx] = _replace_cache_slice(kv_cache.value_cache[layer_idx], start, end, value)
         return
 
     layer = kv_cache.layers[layer_idx]
-    layer.keys[:, :, start:end, :] = key
-    layer.values[:, :, start:end, :] = value
+    layer.keys = _replace_cache_slice(layer.keys, start, end, key)
+    layer.values = _replace_cache_slice(layer.values, start, end, value)
 
 
 def _get_kv_cache_slice(kv_cache: Cache, layer_idx: int, start: int, end: int):
