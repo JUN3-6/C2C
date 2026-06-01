@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 LOG_DIR=${LOG_DIR:-local/logs/kv_align_crossattn_nores_4090_1gpu}
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}

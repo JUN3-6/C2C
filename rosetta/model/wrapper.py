@@ -19,12 +19,33 @@ except Exception:
     GreedySearchDecoderOnlyOutput = None
     SampleDecoderOnlyOutput = None
 
+def _iter_kv_layers(kv_cache: Cache):
+    if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
+        return tuple(zip(kv_cache.key_cache, kv_cache.value_cache))
+    if hasattr(kv_cache, "to_legacy_cache"):
+        return kv_cache.to_legacy_cache()
+    return tuple(kv_cache)
+
+
 def clone_kv_cache(kv_cache: DynamicCache) -> DynamicCache:
-        new_cache = DynamicCache()
-        for k, v in zip(kv_cache.key_cache, kv_cache.value_cache):
-            new_cache.key_cache.append(k.clone().detach())
-            new_cache.value_cache.append(v.clone().detach())
-        return new_cache
+    legacy_cache = tuple((k.clone().detach(), v.clone().detach()) for k, v in _iter_kv_layers(kv_cache))
+    return DynamicCache.from_legacy_cache(legacy_cache)
+
+
+def _set_kv_cache_slice(kv_cache: Cache, layer_idx: int, start: int, end: int, key: torch.Tensor, value: torch.Tensor) -> None:
+    if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
+        kv_cache.key_cache[layer_idx][:, :, start:end, :] = key
+        kv_cache.value_cache[layer_idx][:, :, start:end, :] = value
+        return
+
+    layer = kv_cache.layers[layer_idx]
+    layer.keys[:, :, start:end, :] = key
+    layer.values[:, :, start:end, :] = value
+
+
+def _get_kv_cache_slice(kv_cache: Cache, layer_idx: int, start: int, end: int):
+    key, value = kv_cache[layer_idx]
+    return key[:, :, start:end, :], value[:, :, start:end, :]
 
 def hybrid_to_dynamic(hybrid_cache):
     if hybrid_cache is None:
@@ -328,15 +349,13 @@ class RosettaModel(nn.Module):
             agg_key, agg_value = projected_kv_list[0]
 
             # Update cache
-            fused_kv_cache.key_cache[target_layer_idx][:, :, -new_length:, :] = agg_key
-            fused_kv_cache.value_cache[target_layer_idx][:, :, -new_length:, :] = agg_value
+            _set_kv_cache_slice(fused_kv_cache, target_layer_idx, -new_length, None, agg_key, agg_value)
 
         # Monkeypatch attention forward so the modified KV is used in *this* forward pass.
         hook_handlers = []  # list of (attn_module, orig_forward)
         for i in range(self.model_list[self.base_model_idx].config.num_hidden_layers):
             attn = self.model_list[self.base_model_idx].model.layers[i].self_attn
-            new_k = fused_kv_cache.key_cache[i][:, :, -new_length:, :]
-            new_v = fused_kv_cache.value_cache[i][:, :, -new_length:, :]
+            new_k, new_v = _get_kv_cache_slice(fused_kv_cache, i, -new_length, None)
             orig_forward = RosettaModel._monkeypatch_qwen3_attention_forward(attn, new_k, new_v)
             hook_handlers.append((attn, orig_forward))
 
@@ -557,8 +576,7 @@ class RosettaModel(nn.Module):
                                 # Collect or apply projection based on mode
                                 if self.multi_source_fusion_mode == "sequential":
                                     # Sequential: apply immediately so next source sees updated cache
-                                    curr_base_kv_cache.key_cache[target_layer_idx][:, :, start:end, :] = agg_key
-                                    curr_base_kv_cache.value_cache[target_layer_idx][:, :, start:end, :] = agg_value
+                                    _set_kv_cache_slice(curr_base_kv_cache, target_layer_idx, start, end, agg_key, agg_value)
                                 else:
                                     # Parallel: accumulate residuals (agg - base) for this target layer
                                     if target_layer_idx not in parallel_delta_cache:
@@ -577,8 +595,14 @@ class RosettaModel(nn.Module):
                                 base_key_cache, base_value_cache = base_cache[target_layer_idx]
                                 base_key_slice = base_key_cache[:, :, start:end, :]
                                 base_value_slice = base_value_cache[:, :, start:end, :]
-                                curr_base_kv_cache.key_cache[target_layer_idx][:, :, start:end, :] = base_key_slice + delta_key
-                                curr_base_kv_cache.value_cache[target_layer_idx][:, :, start:end, :] = base_value_slice + delta_value
+                                _set_kv_cache_slice(
+                                    curr_base_kv_cache,
+                                    target_layer_idx,
+                                    start,
+                                    end,
+                                    base_key_slice + delta_key,
+                                    base_value_slice + delta_value,
+                                )
 
                 output.past_key_values = curr_base_kv_cache
                                                                              
