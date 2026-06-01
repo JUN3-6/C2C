@@ -1667,6 +1667,200 @@ register_model("LatentSpaceKVAlignmentCrossAttentionNoResidualProjector")(C2CKVA
 
 @register_model
 @capture_init_args
+class C2CPaperStyleKVAlignmentProjector(Projector):
+    """
+    Paper-style KV cache translator adapted to the C2C per-layer interface.
+
+    This variant removes the Perceiver-style latent bottleneck, dynamic gate,
+    scalar weighting, and receiver residual. For each key/value stream:
+
+        source KV flat -> seed tokens
+        source KV flat -> memory tokens
+        seed tokens cross-attend directly to source memory tokens
+        translator FFN stack -> target KV
+
+    The target KV is only used for output shape. The translated KV itself is
+    written into the receiver cache, matching the no-residual cache translation
+    setup more closely than the C2C residual projectors.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        shared_dim: int = 256,
+        intermediate_dim: int = 512,
+        num_layers: int = 2,
+        num_attention_heads: int = 4,
+        dropout: float = 0.1,
+        dtype: torch.dtype = torch.float32,
+        zero_init: bool = False,
+        up_proj_scale: Optional[float] = None,
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if shared_dim % num_attention_heads != 0:
+            raise ValueError("shared_dim must be divisible by num_attention_heads")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.shared_dim = shared_dim
+        self.intermediate_dim = intermediate_dim
+        self.num_attention_heads = num_attention_heads
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.key_seed_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.value_seed_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.key_memory_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+        self.value_memory_norm = nn.LayerNorm(source_flat_dim, dtype=dtype)
+
+        self.key_seed_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.value_seed_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.key_memory_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+        self.value_memory_proj = nn.Linear(source_flat_dim, shared_dim, bias=True, dtype=dtype)
+
+        self.key_cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(
+                shared_dim,
+                num_attention_heads,
+                dropout=dropout,
+                batch_first=True,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        ])
+        self.value_cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(
+                shared_dim,
+                num_attention_heads,
+                dropout=dropout,
+                batch_first=True,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        ])
+        self.key_attn_norm = nn.ModuleList([nn.LayerNorm(shared_dim, dtype=dtype) for _ in range(num_layers)])
+        self.value_attn_norm = nn.ModuleList([nn.LayerNorm(shared_dim, dtype=dtype) for _ in range(num_layers)])
+        self.key_ffn = nn.ModuleList([
+            StandardFFNLayer(shared_dim, intermediate_dim, dropout=dropout, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.value_ffn = nn.ModuleList([
+            StandardFFNLayer(shared_dim, intermediate_dim, dropout=dropout, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+
+        self.key_out_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.value_out_norm = nn.LayerNorm(shared_dim, dtype=dtype)
+        self.key_out = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+        self.value_out = nn.Linear(shared_dim, target_flat_dim, bias=True, dtype=dtype)
+
+        if zero_init:
+            nn.init.zeros_(self.key_out.weight)
+            nn.init.zeros_(self.key_out.bias)
+            nn.init.zeros_(self.value_out.weight)
+            nn.init.zeros_(self.value_out.bias)
+        elif up_proj_scale is not None:
+            nn.init.kaiming_uniform_(self.key_out.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.value_out.weight, a=math.sqrt(5))
+            self.key_out.weight.data.mul_(up_proj_scale)
+            self.value_out.weight.data.mul_(up_proj_scale)
+            if self.key_out.bias is not None:
+                nn.init.zeros_(self.key_out.bias)
+            if self.value_out.bias is not None:
+                nn.init.zeros_(self.value_out.bias)
+
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def _translate_path(
+        self,
+        source_flat: Tensor,
+        target_dtype: torch.dtype,
+        seed_norm: nn.LayerNorm,
+        seed_proj: nn.Linear,
+        memory_norm: nn.LayerNorm,
+        memory_proj: nn.Linear,
+        cross_attn_layers: nn.ModuleList,
+        attn_norm_layers: nn.ModuleList,
+        ffn_layers: nn.ModuleList,
+        out_norm: nn.LayerNorm,
+        out_proj: nn.Linear,
+    ) -> Tensor:
+        source_input = source_flat.to(dtype=target_dtype).clone()
+        hidden = self.act(seed_proj(seed_norm(source_input)))
+        memory = self.act(memory_proj(memory_norm(source_input)))
+
+        for attn, attn_norm, ffn in zip(cross_attn_layers, attn_norm_layers, ffn_layers):
+            attn_out, _ = attn(query=hidden, key=memory, value=memory, need_weights=False)
+            hidden = attn_norm(hidden + self.drop(attn_out))
+            hidden = ffn(hidden)
+
+        return out_proj(out_norm(hidden))
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, Nt, Dt = target_key.shape
+        if Nt != N:
+            raise ValueError(f"source and target KV lengths must match; got {N} and {Nt}")
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+
+        key_flat = self._translate_path(
+            source_key_flat,
+            target_key.dtype,
+            self.key_seed_norm,
+            self.key_seed_proj,
+            self.key_memory_norm,
+            self.key_memory_proj,
+            self.key_cross_attn,
+            self.key_attn_norm,
+            self.key_ffn,
+            self.key_out_norm,
+            self.key_out,
+        )
+        value_flat = self._translate_path(
+            source_value_flat,
+            target_value.dtype,
+            self.value_seed_norm,
+            self.value_seed_proj,
+            self.value_memory_norm,
+            self.value_memory_proj,
+            self.value_cross_attn,
+            self.value_attn_norm,
+            self.value_ffn,
+            self.value_out_norm,
+            self.value_out,
+        )
+
+        output_key = key_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        output_value = value_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        return output_key, output_value
+
+register_model("KVAlignmentPaperStyleProjector")(C2CPaperStyleKVAlignmentProjector)
+register_model("PaperStyleKVAlignmentProjector")(C2CPaperStyleKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentPaperStyleProjector")(C2CPaperStyleKVAlignmentProjector)
+
+@register_model
+@capture_init_args
 class C2CKVAlignmentNoResidualProjector(C2CKVAlignmentProjector):
     """
     KV alignment projector without receiver residual preservation.
