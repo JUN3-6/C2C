@@ -1391,6 +1391,7 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
         gate_init: float = 0.0,
         zero_init: bool = False,
         up_proj_scale: Optional[float] = None,
+        use_target_residual: bool = True,
     ):
         super().__init__()
 
@@ -1409,6 +1410,7 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
         self.intermediate_dim = intermediate_dim
         self.num_latents = num_latents
         self.num_attention_heads = num_attention_heads
+        self.use_target_residual = use_target_residual
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -1638,8 +1640,14 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
 
-        output_key = target_key + key_gate * norm_key_scalar * projected_key
-        output_value = target_value + value_gate * norm_value_scalar * projected_value
+        key_delta = key_gate * norm_key_scalar * projected_key
+        value_delta = value_gate * norm_value_scalar * projected_value
+        if self.use_target_residual:
+            output_key = target_key + key_delta
+            output_value = target_value + value_delta
+        else:
+            output_key = key_delta
+            output_value = value_delta
 
         try:
             self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
@@ -1653,6 +1661,9 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
 
 register_model("KVAlignmentCrossAttentionProjector")(C2CKVAlignmentCrossAttentionProjector)
 register_model("LatentSpaceKVAlignmentCrossAttentionProjector")(C2CKVAlignmentCrossAttentionProjector)
+register_model("KVAlignmentCrossAttentionNoResidualProjector")(C2CKVAlignmentCrossAttentionProjector)
+register_model("C2CKVAlignmentCrossAttentionNoResidualProjector")(C2CKVAlignmentCrossAttentionProjector)
+register_model("LatentSpaceKVAlignmentCrossAttentionNoResidualProjector")(C2CKVAlignmentCrossAttentionProjector)
 
 @register_model
 @capture_init_args
