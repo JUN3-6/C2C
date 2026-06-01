@@ -1,0 +1,26 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen2.5-0.5B-Instruct
+    is_do_alignment: false
+    alignment_strategy: "first"
+    checkpoints_dir: local/checkpoints/0.6+0.5B_C2C_kv_align_crossattn_nores_small_MMLU_15k_gpu1/final
+    include_response: false
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/0.6+0.5B_C2C_kv_align_crossattn_nores_small_MMLU_15k_gpu1_mmlu_redux
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  dataset_cache_dir: local/hf_datasets_cache/mmlu_redux_kv_align_crossattn_nores_small_gpu1_eval
+  math_grading_method: "comprehensive"

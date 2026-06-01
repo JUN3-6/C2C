@@ -440,6 +440,11 @@ def train_step(model: nn.Module, batch: Dict[str, Any], tokenizer: AutoTokenizer
         
         loss = outputs.loss
 
+        if loss is not None and not loss.requires_grad:
+            anchor_param = next((p for p in model.parameters() if p.requires_grad), None)
+            if anchor_param is not None:
+                loss = loss + anchor_param.float().sum() * 0.0
+
         # Additional loss terms for Rosetta model
         # model_to_use = model.module if hasattr(model, "module") else model
         # for proj in model_to_use.projector_list:
