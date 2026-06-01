@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import Cache, DynamicCache
-from typing import Optional, Tuple, Literal, Union
+from typing import Optional, Tuple, Literal, Union, List
 import copy
 import math
 
@@ -1858,6 +1858,291 @@ class C2CPaperStyleKVAlignmentProjector(Projector):
 register_model("KVAlignmentPaperStyleProjector")(C2CPaperStyleKVAlignmentProjector)
 register_model("PaperStyleKVAlignmentProjector")(C2CPaperStyleKVAlignmentProjector)
 register_model("LatentSpaceKVAlignmentPaperStyleProjector")(C2CPaperStyleKVAlignmentProjector)
+
+
+class _LayerwiseCrossAttentionStack(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.attn = nn.ModuleList([
+            nn.MultiheadAttention(
+                hidden_dim,
+                num_attention_heads,
+                dropout=dropout,
+                batch_first=True,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.ModuleList([nn.LayerNorm(hidden_dim, dtype=dtype) for _ in range(num_layers)])
+        self.ffn = nn.ModuleList([
+            StandardFFNLayer(hidden_dim, intermediate_dim, dropout=dropout, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, layer_hidden: Tensor) -> Tensor:
+        hidden = layer_hidden[:, :, 0, :]
+        outputs = []
+        for layer_idx, (attn, norm, ffn) in enumerate(zip(self.attn, self.norm, self.ffn)):
+            memory = layer_hidden[:, :, layer_idx, :]
+            attn_out, _ = attn(query=hidden, key=memory, value=memory, need_weights=False)
+            hidden = norm(hidden + self.drop(attn_out))
+            hidden = ffn(hidden)
+            outputs.append(hidden)
+        return torch.stack(outputs, dim=2)
+
+
+class _LocalToSharedAdapter(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        local_dim: int,
+        shared_dim: int,
+        adapter_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.local_dim = local_dim
+        self.input_norm = nn.LayerNorm(local_dim, dtype=dtype)
+        self.input_proj = nn.Linear(local_dim, adapter_dim, dtype=dtype)
+        self.mixer = _LayerwiseCrossAttentionStack(
+            num_layers,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.output_norm = nn.LayerNorm(num_layers * adapter_dim, dtype=dtype)
+        self.output_proj = nn.Linear(num_layers * adapter_dim, shared_dim, dtype=dtype)
+        self.act = nn.GELU()
+
+    def forward(self, local_cache: Tensor) -> Tensor:
+        hidden = self.act(self.input_proj(self.input_norm(local_cache)))
+        mixed = self.mixer(hidden)
+        mixed = mixed.reshape(mixed.size(0), mixed.size(1), self.num_layers * mixed.size(-1))
+        return self.output_proj(self.output_norm(mixed))
+
+
+class _SharedToLocalAdapter(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        local_dim: int,
+        shared_dim: int,
+        adapter_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+        output_mode: Literal["concat", "per_layer"] = "concat",
+    ):
+        super().__init__()
+        if shared_dim % num_layers != 0:
+            raise ValueError(f"shared_dim ({shared_dim}) must be divisible by num_layers ({num_layers})")
+        if output_mode not in {"concat", "per_layer"}:
+            raise ValueError(f"output_mode must be 'concat' or 'per_layer', got {output_mode}")
+
+        self.num_layers = num_layers
+        self.local_dim = local_dim
+        self.shared_dim = shared_dim
+        self.shared_layer_dim = shared_dim // num_layers
+        self.output_mode = output_mode
+
+        self.input_norm = nn.LayerNorm(self.shared_layer_dim, dtype=dtype)
+        self.input_proj = nn.Linear(self.shared_layer_dim, adapter_dim, dtype=dtype)
+        self.mixer = _LayerwiseCrossAttentionStack(
+            num_layers,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        if output_mode == "concat":
+            self.output_norm = nn.LayerNorm(num_layers * adapter_dim, dtype=dtype)
+            self.output_proj = nn.Linear(num_layers * adapter_dim, num_layers * local_dim, dtype=dtype)
+        else:
+            self.output_norm = nn.LayerNorm(adapter_dim, dtype=dtype)
+            self.output_proj = nn.Linear(adapter_dim, local_dim, dtype=dtype)
+        self.act = nn.GELU()
+
+    def forward(self, shared_cache: Tensor) -> Tensor:
+        B, S, _ = shared_cache.shape
+        layer_input = shared_cache.view(B, S, self.num_layers, self.shared_layer_dim)
+        hidden = self.act(self.input_proj(self.input_norm(layer_input)))
+        mixed = self.mixer(hidden)
+
+        if self.output_mode == "concat":
+            flat = mixed.reshape(B, S, self.num_layers * mixed.size(-1))
+            local = self.output_proj(self.output_norm(flat))
+            return local.view(B, S, self.num_layers, self.local_dim)
+
+        return self.output_proj(self.output_norm(mixed))
+
+
+@register_model
+@capture_init_args
+class C2CSharedSpaceKVAlignmentProjector(Projector):
+    """
+    Full-cache shared-space KV translator inspired by the KV Alignment paper.
+
+    Unlike C2C's per-layer projectors, this module translates the full source
+    prefix KV block into an implicit shared space and then translates that
+    shared representation into the full target prefix KV block:
+
+        source all-layer KV -> T[source -> shared] -> shared KV
+        shared KV -> T[shared -> target] -> target all-layer KV
+
+    Keys and values use separate adapters. No receiver residual is added.
+    """
+
+    is_full_cache_projector = True
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        source_num_layers: int = 1,
+        target_num_layers: int = 1,
+        shared_dim: int = 672,
+        adapter_dim: int = 32,
+        intermediate_dim: int = 128,
+        num_attention_heads: int = 4,
+        dropout: float = 0.1,
+        output_mode: Literal["concat", "per_layer"] = "concat",
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        if adapter_dim % num_attention_heads != 0:
+            raise ValueError("adapter_dim must be divisible by num_attention_heads")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.source_num_layers = source_num_layers
+        self.target_num_layers = target_num_layers
+        self.shared_dim = shared_dim
+        self.adapter_dim = adapter_dim
+        self.output_mode = output_mode
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.key_source_to_shared = _LocalToSharedAdapter(
+            source_num_layers,
+            source_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.value_source_to_shared = _LocalToSharedAdapter(
+            source_num_layers,
+            source_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.key_shared_to_target = _SharedToLocalAdapter(
+            target_num_layers,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+        self.value_shared_to_target = _SharedToLocalAdapter(
+            target_num_layers,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+
+    @staticmethod
+    def _cache_layers_to_local(layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> Tensor:
+        stream_layers = []
+        for key, value in layers:
+            tensor = key if stream_idx == 0 else value
+            B, H, S, D = tensor.shape
+            stream_layers.append(tensor.transpose(1, 2).contiguous().view(B, S, H * D))
+        return torch.stack(stream_layers, dim=2)
+
+    @staticmethod
+    def _local_to_cache_layers(local_cache: Tensor, target_layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> List[Tensor]:
+        outputs = []
+        for layer_idx, (target_key, target_value) in enumerate(target_layers):
+            target = target_key if stream_idx == 0 else target_value
+            B, H, S, D = target.shape
+            layer_flat = local_cache[:, :, layer_idx, :].to(dtype=target.dtype)
+            outputs.append(layer_flat.view(B, S, H, D).transpose(1, 2).contiguous())
+        return outputs
+
+    def forward_cache(
+        self,
+        source_layers: List[Tuple[Tensor, Tensor]],
+        target_layers: List[Tuple[Tensor, Tensor]],
+    ) -> List[Tuple[Tensor, Tensor]]:
+        if len(source_layers) != self.source_num_layers:
+            raise ValueError(f"expected {self.source_num_layers} source layers, got {len(source_layers)}")
+        if len(target_layers) != self.target_num_layers:
+            raise ValueError(f"expected {self.target_num_layers} target layers, got {len(target_layers)}")
+
+        source_key_local = self._cache_layers_to_local(source_layers, stream_idx=0)
+        source_value_local = self._cache_layers_to_local(source_layers, stream_idx=1)
+
+        shared_key = self.key_source_to_shared(source_key_local)
+        shared_value = self.value_source_to_shared(source_value_local)
+
+        target_key_local = self.key_shared_to_target(shared_key)
+        target_value_local = self.value_shared_to_target(shared_value)
+
+        target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
+        target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
+        return list(zip(target_keys, target_values))
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        raise NotImplementedError("C2CSharedSpaceKVAlignmentProjector requires forward_cache with all layers")
+
+
+register_model("SharedSpaceKVAlignmentProjector")(C2CSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentSharedSpaceProjector")(C2CSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentSharedProjector")(C2CSharedSpaceKVAlignmentProjector)
+
 
 @register_model
 @capture_init_args

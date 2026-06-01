@@ -322,8 +322,10 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         projector_params = projector_config["params"].copy()
         projector_params["dtype"] = dtype
         projector_list = []
-        # Only M projectors (share projector across sources): one per target layer
-        num_projectors = slm_num_layers
+        full_cache_projector = projector_config.get("full_cache", False)
+        # Standard C2C uses one projector per target layer. Shared-space KV
+        # alignment uses one projector for the complete all-layer cache block.
+        num_projectors = 1 if full_cache_projector else slm_num_layers
 
         # shared_key_projection=build_shared_mlp(
         #     source_dim=teacher_dim,
@@ -344,6 +346,12 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         #     dtype=dtype
         # )
         for _ in range(num_projectors):
+            extra_projector_params = {}
+            if full_cache_projector:
+                extra_projector_params = {
+                    "source_num_layers": llm_num_layers,
+                    "target_num_layers": slm_num_layers,
+                }
             projector = create_projector(
                 projector_config["type"],
                 source_dim=teacher_dim,
@@ -352,6 +360,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
                 target_num_heads=base_num_heads,
                 # shared_key_projection=shared_key_projection,
                 # shared_value_projection=shared_value_projection,
+                **extra_projector_params,
                 **projector_params
             )
             projector_list.append(projector.to(device))
@@ -368,25 +377,35 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         ).to(device).eval()
         
         
-        # mapping stretegy
-        if model_config["mapping"] == "last_aligned":
-            source_target_mapping = last_aligned_sources(slm_num_layers, llm_num_layers, K)
-        elif model_config["mapping"] == "k_nearest":
-            source_target_mapping = k_nearest_sources(slm_num_layers, llm_num_layers, K)
+        if full_cache_projector:
+            rosetta_model.set_projector_config(
+                source_model_idx=1,  # Teacher model
+                source_model_layer_idx=-1,
+                target_model_idx=0,  # Base model
+                target_model_layer_idx=-1,
+                projector_idx=0,
+            )
+            print("Using full-cache shared-space KV alignment projector")
         else:
-            raise ValueError(f"Invalid mapping strategy: {model_config['mapping']}")
-        print(f"Using {model_config['mapping']} mapping strategy (target: [sources])")
+            # mapping stretegy
+            if model_config["mapping"] == "last_aligned":
+                source_target_mapping = last_aligned_sources(slm_num_layers, llm_num_layers, K)
+            elif model_config["mapping"] == "k_nearest":
+                source_target_mapping = k_nearest_sources(slm_num_layers, llm_num_layers, K)
+            else:
+                raise ValueError(f"Invalid mapping strategy: {model_config['mapping']}")
+            print(f"Using {model_config['mapping']} mapping strategy (target: [sources])")
 
-        # set projector
-        for target_layer_idx, src_list in source_target_mapping.items():
-            for source_layer_idx in src_list:
-                rosetta_model.set_projector_config(
-                    source_model_idx=1,  # Teacher model
-                    source_model_layer_idx=source_layer_idx,
-                    target_model_idx=0,  # Base model
-                    target_model_layer_idx=target_layer_idx,
-                    projector_idx=target_layer_idx,  # share projector per target layer
-                )
+            # set projector
+            for target_layer_idx, src_list in source_target_mapping.items():
+                for source_layer_idx in src_list:
+                    rosetta_model.set_projector_config(
+                        source_model_idx=1,  # Teacher model
+                        source_model_layer_idx=source_layer_idx,
+                        target_model_idx=0,  # Base model
+                        target_model_layer_idx=target_layer_idx,
+                        projector_idx=target_layer_idx,  # share projector per target layer
+                    )
 
         # Optional aligner construction (used by collator)
         aligner = None

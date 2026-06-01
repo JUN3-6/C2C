@@ -182,6 +182,20 @@ class RosettaModel(nn.Module):
         # Fallback: return the first projector
         return self.projector_list[pair_list[0][1]]
 
+    def get_full_cache_projector(self, source_model_idx: int, target_model_idx: Optional[int] = None):
+        target_model_idx = self.base_model_idx if target_model_idx is None else target_model_idx
+        target_projectors = self.projector_dict.get(target_model_idx, {})
+        source_projectors = target_projectors.get(source_model_idx, {})
+        full_cache_entry = source_projectors.get(-1)
+        if not full_cache_entry:
+            return None
+
+        _, projector_idx = full_cache_entry[0]
+        projector = self.projector_list[projector_idx]
+        if not getattr(projector, "is_full_cache_projector", False):
+            return None
+        return projector
+
     @staticmethod
     def load_json(file_name):
         with open(file_name, "r") as f:
@@ -555,6 +569,35 @@ class RosettaModel(nn.Module):
                             # Check if this sharer is selected: bit (source_model_idx - 1)
                             if not (sharer_mask & (1 << (source_model_idx - 1))):
                                 continue
+
+                            full_cache_projector = self.get_full_cache_projector(source_model_idx)
+                            if full_cache_projector is not None:
+                                source_layers = [
+                                    (
+                                        source_key[:, :, start:end, :],
+                                        source_value[:, :, start:end, :],
+                                    )
+                                    for source_key, source_value in _iter_kv_layers(self.kv_cache_dict[self.base_model_idx][source_model_idx])
+                                ]
+                                target_layers = [
+                                    (
+                                        target_key[:, :, start:end, :],
+                                        target_value[:, :, start:end, :],
+                                    )
+                                    for target_key, target_value in _iter_kv_layers(curr_base_kv_cache)
+                                ]
+                                projected_layers = full_cache_projector.forward_cache(source_layers, target_layers)
+                                for target_layer_idx, (projected_key, projected_value) in enumerate(projected_layers):
+                                    _set_kv_cache_slice(
+                                        curr_base_kv_cache,
+                                        target_layer_idx,
+                                        start,
+                                        end,
+                                        projected_key,
+                                        projected_value,
+                                    )
+                                continue
+
                             if self.multi_source_fusion_mode == "sequential":
                                 base_cache_ref = curr_base_kv_cache
                             else:
