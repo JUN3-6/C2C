@@ -8,10 +8,10 @@
         "projector": {
             "type": "C2CKVAlignmentCrossAttentionNoResidualProjector",
             "params": {
-                "shared_dim": 256,
-                "intermediate_dim": 512,
+                "shared_dim": 128,
+                "intermediate_dim": 256,
                 "num_layers": 2,
-                "num_latents": 16,
+                "num_latents": 8,
                 "num_attention_heads": 4,
                 "dropout": 0.1,
                 "initial_temperature": 1.0,
@@ -26,26 +26,26 @@
         "learning_rate": 1e-4,
         "weight_decay": 0.01,
         "num_epochs": 1,
-        "max_length": 1024,
+        "max_length": 512,
         "device": "cuda",
         "scheduler_type": "linear",
         "warmup_ratio": 0.1,
         "max_grad_norm": 1.0,
-        "gradient_accumulation_steps": 256,
+        "gradient_accumulation_steps": 64,
         "per_device_train_batch_size": 1,
         "num_processes": 1,
         "freeze": ["teacher", "base"],
         "seed": 42
     },
     "output": {
-        "output_dir": "local/checkpoints/0.6+0.5B_C2C_kv_align_crossattn_nores_MMLU_15k_4090_1gpu",
+        "output_dir": "local/checkpoints/0.6+0.5B_C2C_kv_align_crossattn_nores_small_MMLU_15k_4090_1gpu",
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
             "project": "C2C",
             "mode": "online",
             "entity": "june6-hanyang-university",
-            "run_name": "0.6+0.5B_C2C_kv_align_crossattn_nores_MMLU_15k_4090_1gpu"
+            "run_name": "0.6+0.5B_C2C_kv_align_crossattn_nores_small_MMLU_15k_4090_1gpu"
         }
     },
     "data": {
@@ -54,7 +54,7 @@
             "split": "auxiliary_train",
             "max_word_count": 1024,
             "num_samples": 15000,
-            "cache_dir": "local/hf_datasets_cache/mmlu_kv_align_crossattn_nores_15k_4090_1gpu"
+            "cache_dir": "local/hf_datasets_cache/mmlu_kv_align_crossattn_nores_small_15k_4090_1gpu"
         },
         "train_ratio": 0.99
     }
