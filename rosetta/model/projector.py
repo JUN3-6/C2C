@@ -2006,7 +2006,8 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         source all-layer KV -> T[source -> shared] -> shared KV
         shared KV -> T[shared -> target] -> target all-layer KV
 
-    Keys and values use separate adapters. No receiver residual is added.
+    Keys and values use separate adapters. Receiver residual is optional; the
+    default preserves the original no-residual shared-space behavior.
     """
 
     is_full_cache_projector = True
@@ -2026,6 +2027,8 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         output_mode: Literal["concat", "per_layer"] = "concat",
+        use_target_residual: bool = False,
+        residual_scale: float = 1.0,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -2041,6 +2044,8 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
         self.shared_dim = shared_dim
         self.adapter_dim = adapter_dim
         self.output_mode = output_mode
+        self.use_target_residual = use_target_residual
+        self.residual_scale = residual_scale
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -2128,6 +2133,15 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
 
         target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
         target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
+        if self.use_target_residual:
+            target_keys = [
+                base_key + self.residual_scale * projected_key
+                for projected_key, (base_key, _) in zip(target_keys, target_layers)
+            ]
+            target_values = [
+                base_value + self.residual_scale * projected_value
+                for projected_value, (_, base_value) in zip(target_values, target_layers)
+            ]
         return list(zip(target_keys, target_values))
 
     def forward(
@@ -2143,6 +2157,9 @@ class C2CSharedSpaceKVAlignmentProjector(Projector):
 register_model("SharedSpaceKVAlignmentProjector")(C2CSharedSpaceKVAlignmentProjector)
 register_model("KVAlignmentSharedSpaceProjector")(C2CSharedSpaceKVAlignmentProjector)
 register_model("LatentSpaceKVAlignmentSharedProjector")(C2CSharedSpaceKVAlignmentProjector)
+register_model("SharedSpaceKVAlignmentResidualProjector")(C2CSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentSharedSpaceResidualProjector")(C2CSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentSharedResidualProjector")(C2CSharedSpaceKVAlignmentProjector)
 
 
 class _KVMemoryCrossAttentionStack(nn.Module):
@@ -2348,6 +2365,8 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         output_mode: Literal["concat", "per_layer"] = "concat",
+        use_target_residual: bool = False,
+        residual_scale: float = 1.0,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -2364,6 +2383,8 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         self.shared_dim = shared_dim
         self.adapter_dim = adapter_dim
         self.output_mode = output_mode
+        self.use_target_residual = use_target_residual
+        self.residual_scale = residual_scale
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -2445,6 +2466,15 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
         target_value_local = self.value_shared_to_target(shared, source_hidden_states, source_attention_mask)
         target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
         target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
+        if self.use_target_residual:
+            target_keys = [
+                base_key + self.residual_scale * projected_key
+                for projected_key, (base_key, _) in zip(target_keys, target_layers)
+            ]
+            target_values = [
+                base_value + self.residual_scale * projected_value
+                for projected_value, (_, base_value) in zip(target_values, target_layers)
+            ]
         return list(zip(target_keys, target_values))
 
     def forward(
@@ -2460,6 +2490,9 @@ class C2CHiddenSeedSharedSpaceKVAlignmentProjector(Projector):
 register_model("HiddenSeedSharedSpaceKVAlignmentProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
 register_model("KVAlignmentHiddenSeedSharedSpaceProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
 register_model("LatentSpaceKVAlignmentHiddenSeedProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
+register_model("HiddenSeedSharedSpaceKVAlignmentResidualProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentHiddenSeedSharedSpaceResidualProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentHiddenSeedResidualProjector")(C2CHiddenSeedSharedSpaceKVAlignmentProjector)
 
 
 @register_model
