@@ -31,21 +31,21 @@
         "scheduler_type": "linear",
         "warmup_ratio": 0.1,
         "max_grad_norm": 1.0,
-        "gradient_accumulation_steps": 64,
-        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 16,
+        "per_device_train_batch_size": 8,
         "num_processes": 2,
         "freeze": ["teacher", "base"],
         "seed": 42
     },
     "output": {
-        "output_dir": "local/checkpoints/0.6+0.5B_C2C_kv_align_hiddenseed_sharedspace_residual_OpenHermes_500k_bs2_2gpu",
+        "output_dir": "local/checkpoints/0.6+0.5B_C2C_kv_align_hiddenseed_sharedspace_residual_OpenHermes_500k_bs8_2gpu",
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
             "project": "C2C",
             "mode": "online",
             "entity": "june6-hanyang-university",
-            "run_name": "0.6+0.5B_C2C_kv_align_hiddenseed_sharedspace_residual_OpenHermes_500k_bs2_2gpu"
+            "run_name": "0.6+0.5B_C2C_kv_align_hiddenseed_sharedspace_residual_OpenHermes_500k_bs8_2gpu"
         }
     },
     "data": {
