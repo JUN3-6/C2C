@@ -30,6 +30,7 @@ import re
 import sys
 import re
 import hashlib
+import types
 
 from rosetta.utils.evaluate import (
     extract_answer_from_content,
@@ -299,6 +300,99 @@ class UnifiedEvaluator:
         print(f"Available GPUs: {torch.cuda.device_count()}")
         print(f"Requested GPU IDs: {self.eval_config['gpu_ids']}")
         print(f"Answer method: {self.eval_config['answer_method']}")
+
+    def _patch_rosetta_projector_dtype(self, model) -> None:
+        """Keep projector outputs in the receiver KV dtype for this shuffle eval.
+
+        Some projector variants can emit float32 tensors even when the receiver
+        model runs in bf16. Newer attention kernels reject mixed q/k/v dtypes, so
+        this evaluator casts projector inputs to the projector dtype and outputs
+        back to the target KV dtype. This patch is intentionally local to the
+        choice-shuffle evaluator so the standard evaluator stays unchanged.
+        """
+        if not hasattr(model, "projector_list") or not hasattr(model, "model_list"):
+            return
+
+        base_idx = int(getattr(model, "base_model_idx", 0))
+        base_model = model.model_list[base_idx]
+        device = getattr(base_model, "device", None)
+        base_dtype = getattr(base_model, "dtype", None)
+
+        if base_dtype is not None:
+            try:
+                model.projector_list.to(device=device, dtype=base_dtype)
+            except TypeError:
+                model.projector_list.to(device=device)
+
+        def projector_dtype(projector, fallback):
+            for param in projector.parameters(recurse=True):
+                return param.dtype
+            for buffer in projector.buffers(recurse=True):
+                return buffer.dtype
+            return fallback
+
+        def cast_pair(pair, dtype):
+            key, value = pair
+            return key.to(dtype=dtype), value.to(dtype=dtype)
+
+        def cast_hidden_kwargs(kwargs, dtype):
+            patched = dict(kwargs)
+            hidden = patched.get("source_hidden_states")
+            if torch.is_tensor(hidden):
+                patched["source_hidden_states"] = hidden.to(dtype=dtype)
+            elif isinstance(hidden, (list, tuple)):
+                patched["source_hidden_states"] = type(hidden)(
+                    item.to(dtype=dtype) if torch.is_tensor(item) else item
+                    for item in hidden
+                )
+            return patched
+
+        for projector in model.projector_list:
+            if getattr(projector, "_choice_shuffle_dtype_patch", False):
+                continue
+
+            original_forward = projector.forward
+
+            def patched_forward(self_projector, source_kv, target_kv, *args, _orig=original_forward, **kwargs):
+                target_dtype = target_kv[0].dtype
+                compute_dtype = projector_dtype(self_projector, target_dtype)
+                source_kv = cast_pair(source_kv, compute_dtype)
+                target_kv_for_forward = cast_pair(target_kv, compute_dtype)
+                out_key, out_value = _orig(source_kv, target_kv_for_forward, *args, **kwargs)
+                return out_key.to(dtype=target_dtype), out_value.to(dtype=target_dtype)
+
+            projector.forward = types.MethodType(patched_forward, projector)
+
+            if hasattr(projector, "forward_cache"):
+                original_forward_cache = projector.forward_cache
+
+                def patched_forward_cache(
+                    self_projector,
+                    source_layers,
+                    target_layers,
+                    *args,
+                    _orig=original_forward_cache,
+                    **kwargs,
+                ):
+                    target_dtype = target_layers[0][0].dtype
+                    compute_dtype = projector_dtype(self_projector, target_dtype)
+                    source_layers = [cast_pair(pair, compute_dtype) for pair in source_layers]
+                    target_layers_for_forward = [cast_pair(pair, compute_dtype) for pair in target_layers]
+                    kwargs = cast_hidden_kwargs(kwargs, compute_dtype)
+                    projected_layers = _orig(
+                        source_layers,
+                        target_layers_for_forward,
+                        *args,
+                        **kwargs,
+                    )
+                    return [
+                        (key.to(dtype=target_dtype), value.to(dtype=target_dtype))
+                        for key, value in projected_layers
+                    ]
+
+                projector.forward_cache = types.MethodType(patched_forward_cache, projector)
+
+            projector._choice_shuffle_dtype_patch = True
 
     def _make_subject_splits(self, num_gpus: int) -> List[str]:
         """Create virtual subject splits for datasets without native subjects.
@@ -1649,6 +1743,7 @@ class UnifiedEvaluator:
             print(f"Initialized two-stage pipeline on GPU {gpu_id}")
         elif "rosetta" in self.model_config["model_name"].lower():
             model, tokenizer = load_rosetta_model(self.model_config, self.eval_config, device=device, generation_config=self.generation_config)
+            self._patch_rosetta_projector_dtype(model)
             # Load LLM tokenizer only if alignment is enabled via eval or model config
             rosetta_cfg = self.model_config.get("rosetta_config", {})
             is_do_alignment = self.model_config.get("is_do_alignment", rosetta_cfg.get("is_do_alignment", False))
