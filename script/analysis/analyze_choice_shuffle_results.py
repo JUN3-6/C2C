@@ -11,13 +11,13 @@ from typing import Dict, Iterable, List
 LABELS = list("ABCD")
 
 
-def _latest_cot_csv(path: Path) -> Path:
+def _cot_csvs(path: Path, include_all: bool = False) -> List[Path]:
     if path.is_file():
-        return path
+        return [path]
     matches = sorted(path.glob("*_cot.csv"), key=lambda p: p.stat().st_mtime)
     if not matches:
         raise FileNotFoundError(f"No *_cot.csv found under {path}")
-    return matches[-1]
+    return matches if include_all else [matches[-1]]
 
 
 def _as_bool(value: str) -> bool:
@@ -32,8 +32,7 @@ def _dist(values: Iterable[str], total: int) -> str:
     )
 
 
-def summarize(name: str, path: Path) -> Dict[str, float]:
-    csv_path = _latest_cot_csv(path)
+def summarize_csv(name: str, csv_path: Path) -> Dict[str, float]:
     with csv_path.open(newline="", encoding="utf-8") as f:
         rows: List[Dict[str, str]] = list(csv.DictReader(f))
     if not rows:
@@ -61,7 +60,9 @@ def summarize(name: str, path: Path) -> Dict[str, float]:
         else 0.0
     )
 
-    print(f"\n{name}")
+    seed = rows[0].get("choice_shuffle_seed", "")
+    suffix = f" seed={seed}" if seed != "" else ""
+    print(f"\n{name}{suffix}")
     print(f"  csv: {csv_path}")
     print(f"  n={n} accuracy(new shuffled labels)={acc:.4%}")
     print(f"  pred dist:           {_dist(pred_values, n)}")
@@ -76,6 +77,12 @@ def summarize(name: str, path: Path) -> Dict[str, float]:
     }
 
 
+def summarize(name: str, path: Path, include_all: bool = False) -> None:
+    csv_paths = _cot_csvs(path, include_all=include_all)
+    for csv_path in csv_paths:
+        summarize_csv(name, csv_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -86,10 +93,15 @@ def main() -> None:
         required=True,
         help="Model name and result directory or *_cot.csv path.",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Summarize every *_cot.csv under each result directory instead of only the latest.",
+    )
     args = parser.parse_args()
 
     for name, path in args.result:
-        summarize(name, Path(path))
+        summarize(name, Path(path), include_all=args.all)
 
 
 if __name__ == "__main__":
