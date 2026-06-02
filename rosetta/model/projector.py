@@ -2214,6 +2214,225 @@ class _KVMemoryCrossAttentionStack(nn.Module):
         return torch.stack(outputs, dim=2)
 
 
+class _LocalToSharedReceiverSeedAdapter(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        source_local_dim: int,
+        target_local_dim: int,
+        shared_dim: int,
+        adapter_dim: int,
+        intermediate_dim: int,
+        num_attention_heads: int,
+        dropout: float,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.source_local_dim = source_local_dim
+        self.target_local_dim = target_local_dim
+        self.query_norm = nn.LayerNorm(target_local_dim, dtype=dtype)
+        self.query_proj = nn.Linear(target_local_dim, adapter_dim, dtype=dtype)
+        self.memory_norm = nn.LayerNorm(source_local_dim, dtype=dtype)
+        self.memory_proj = nn.Linear(source_local_dim, adapter_dim, dtype=dtype)
+        self.mixer = _KVMemoryCrossAttentionStack(
+            num_layers,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.output_norm = nn.LayerNorm(num_layers * adapter_dim, dtype=dtype)
+        self.output_proj = nn.Linear(num_layers * adapter_dim, shared_dim, dtype=dtype)
+        self.act = nn.GELU()
+
+    def forward(self, source_local_cache: Tensor, target_local_cache: Tensor) -> Tensor:
+        query_seed = self.act(self.query_proj(self.query_norm(target_local_cache[:, :, 0, :])))
+        memory = self.act(self.memory_proj(self.memory_norm(source_local_cache)))
+        mixed = self.mixer(query_seed, memory, memory)
+        mixed = mixed.reshape(mixed.size(0), mixed.size(1), self.num_layers * mixed.size(-1))
+        return self.output_proj(self.output_norm(mixed))
+
+
+@register_model
+@capture_init_args
+class C2CReceiverSeedSharedSpaceKVAlignmentProjector(Projector):
+    """
+    Full-cache shared-space KV translator using receiver KV as the query seed.
+
+    Source -> shared:
+        query seed: receiver first-layer K/V cache for each token
+        memory: projections of the sharer's original all-layer K/V caches
+
+    Shared -> target:
+        same shared-to-target decoder as the shared-space projector.
+    """
+
+    is_full_cache_projector = True
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        source_num_layers: int = 1,
+        target_num_layers: int = 1,
+        source_hidden_dim: Optional[int] = None,
+        shared_dim: int = 672,
+        adapter_dim: int = 32,
+        intermediate_dim: int = 128,
+        num_attention_heads: int = 4,
+        dropout: float = 0.1,
+        output_mode: Literal["concat", "per_layer"] = "concat",
+        use_target_residual: bool = False,
+        residual_scale: float = 1.0,
+        residual_gate_init: float = -4.0,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        if adapter_dim % num_attention_heads != 0:
+            raise ValueError("adapter_dim must be divisible by num_attention_heads")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.source_num_layers = source_num_layers
+        self.target_num_layers = target_num_layers
+        self.shared_dim = shared_dim
+        self.adapter_dim = adapter_dim
+        self.output_mode = output_mode
+        self.use_target_residual = use_target_residual
+        self.residual_scale = residual_scale
+        self.residual_gate_init = residual_gate_init
+        self.residual_gate_logit = nn.Parameter(
+            torch.tensor(residual_gate_init, dtype=torch.float32),
+            requires_grad=use_target_residual,
+        )
+
+        source_flat_dim = source_dim * source_num_heads
+        target_flat_dim = target_dim * target_num_heads
+
+        self.key_source_to_shared = _LocalToSharedReceiverSeedAdapter(
+            source_num_layers,
+            source_flat_dim,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.value_source_to_shared = _LocalToSharedReceiverSeedAdapter(
+            source_num_layers,
+            source_flat_dim,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+        )
+        self.key_shared_to_target = _SharedToLocalAdapter(
+            target_num_layers,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+        self.value_shared_to_target = _SharedToLocalAdapter(
+            target_num_layers,
+            target_flat_dim,
+            shared_dim,
+            adapter_dim,
+            intermediate_dim,
+            num_attention_heads,
+            dropout,
+            dtype,
+            output_mode=output_mode,
+        )
+
+    @staticmethod
+    def _cache_layers_to_local(layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> Tensor:
+        stream_layers = []
+        for key, value in layers:
+            tensor = key if stream_idx == 0 else value
+            B, H, S, D = tensor.shape
+            stream_layers.append(tensor.transpose(1, 2).contiguous().view(B, S, H * D))
+        return torch.stack(stream_layers, dim=2)
+
+    @staticmethod
+    def _local_to_cache_layers(local_cache: Tensor, target_layers: List[Tuple[Tensor, Tensor]], stream_idx: int) -> List[Tensor]:
+        outputs = []
+        for layer_idx, (target_key, target_value) in enumerate(target_layers):
+            target = target_key if stream_idx == 0 else target_value
+            B, H, S, D = target.shape
+            layer_flat = local_cache[:, :, layer_idx, :].to(dtype=target.dtype)
+            outputs.append(layer_flat.view(B, S, H, D).transpose(1, 2).contiguous())
+        return outputs
+
+    def forward_cache(
+        self,
+        source_layers: List[Tuple[Tensor, Tensor]],
+        target_layers: List[Tuple[Tensor, Tensor]],
+    ) -> List[Tuple[Tensor, Tensor]]:
+        if len(source_layers) != self.source_num_layers:
+            raise ValueError(f"expected {self.source_num_layers} source layers, got {len(source_layers)}")
+        if len(target_layers) != self.target_num_layers:
+            raise ValueError(f"expected {self.target_num_layers} target layers, got {len(target_layers)}")
+
+        source_key_local = self._cache_layers_to_local(source_layers, stream_idx=0)
+        source_value_local = self._cache_layers_to_local(source_layers, stream_idx=1)
+        target_key_local = self._cache_layers_to_local(target_layers, stream_idx=0)
+        target_value_local = self._cache_layers_to_local(target_layers, stream_idx=1)
+
+        shared_key = self.key_source_to_shared(source_key_local, target_key_local)
+        shared_value = self.value_source_to_shared(source_value_local, target_value_local)
+
+        target_key_local = self.key_shared_to_target(shared_key)
+        target_value_local = self.value_shared_to_target(shared_value)
+
+        target_keys = self._local_to_cache_layers(target_key_local, target_layers, stream_idx=0)
+        target_values = self._local_to_cache_layers(target_value_local, target_layers, stream_idx=1)
+        if self.use_target_residual:
+            residual_gate = torch.sigmoid(self.residual_gate_logit)
+            target_keys = [
+                base_key + self.residual_scale * residual_gate.to(dtype=projected_key.dtype) * projected_key
+                for projected_key, (base_key, _) in zip(target_keys, target_layers)
+            ]
+            target_values = [
+                base_value + self.residual_scale * residual_gate.to(dtype=projected_value.dtype) * projected_value
+                for projected_value, (_, base_value) in zip(target_values, target_layers)
+            ]
+            self.last_residual_gate = float(residual_gate.detach().cpu().item())
+        return list(zip(target_keys, target_values))
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        raise NotImplementedError("C2CReceiverSeedSharedSpaceKVAlignmentProjector requires forward_cache with all layers")
+
+
+register_model("ReceiverSeedSharedSpaceKVAlignmentProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentReceiverSeedSharedSpaceProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentReceiverSeedProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+register_model("ReceiverSeedSharedSpaceKVAlignmentResidualProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+register_model("KVAlignmentReceiverSeedSharedSpaceResidualProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+register_model("LatentSpaceKVAlignmentReceiverSeedResidualProjector")(C2CReceiverSeedSharedSpaceKVAlignmentProjector)
+
+
 class _KVToSharedHiddenSeedAdapter(nn.Module):
     def __init__(
         self,
