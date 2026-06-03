@@ -28,6 +28,7 @@ import torch.multiprocessing as mp
 import yaml
 from datasets import load_dataset
 
+from rosetta.model.aligner import AlignmentStrategy, TokenAligner
 from rosetta.model.wrapper import RosettaModel
 from script.evaluation.unified_evaluator_choice_shuffle import (
     DATASET_CONFIGS,
@@ -48,10 +49,16 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
         self._kv_ablation_log_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._kv_ablation_pending_source_inputs: Optional[Dict[str, Any]] = None
         self._kv_ablation_index_stats: Dict[str, Any] = {}
+        self._kv_ablation_llm_tokenizer: Optional[Any] = None
 
     def _kv_ablation_enabled(self) -> bool:
         cfg = self.kv_ablation_config
         return isinstance(cfg, dict) and bool(cfg.get("enabled", False))
+
+    def _kv_ablation_uses_aligner(self) -> bool:
+        rosetta_cfg = self.model_config.get("rosetta_config", {})
+        is_do_alignment = self.model_config.get("is_do_alignment", rosetta_cfg.get("is_do_alignment", False))
+        return bool(is_do_alignment and self._kv_ablation_llm_tokenizer is not None)
 
     def _prompt_chat_text(self, prompt: str, tokenizer) -> str:
         messages = [{"role": "user", "content": prompt}]
@@ -73,6 +80,36 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
         )
 
     def _prompt_token_length(self, prompt: str, tokenizer) -> int:
+        if self._kv_ablation_uses_aligner():
+            messages = [{"role": "user", "content": prompt}]
+            aligner = TokenAligner(
+                slm_tokenizer=tokenizer,
+                llm_tokenizer=self._kv_ablation_llm_tokenizer,
+                strategy=AlignmentStrategy(
+                    self.model_config.get("rosetta_config", {}).get("alignment_strategy", "prefix")
+                ),
+            )
+            if self.eval_config.get("answer_method") == "logits":
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": self.eval_config.get("response_text", "The correct answer is"),
+                    }
+                )
+                add_generation_prompt = False
+                remove_last_surfix = True
+            else:
+                add_generation_prompt = True
+                remove_last_surfix = False
+            details = aligner.align_chat_messages(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                return_details=True,
+                enable_thinking=False,
+                remove_last_surfix=remove_last_surfix,
+            )
+            return int(len(details["slm_ids_padded"]))
+
         text = self._prompt_chat_text(prompt, tokenizer)
         return int(tokenizer(text, return_tensors="pt")["input_ids"].shape[1])
 
@@ -300,8 +337,22 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
         target_ids = prepared["inputs"]["input_ids"]
         donor_ids = donor_prepared["inputs"]["input_ids"]
         if isinstance(target_ids, list) or isinstance(donor_ids, list):
-            raise ValueError("kv_content_ablation currently expects non-aligned Rosetta tensor inputs")
-        if target_ids.shape != donor_ids.shape:
+            if not isinstance(target_ids, list) or not isinstance(donor_ids, list):
+                raise ValueError("KV donor input format mismatch between target and donor")
+            if len(target_ids) != len(donor_ids):
+                raise ValueError(
+                    "KV donor aligned input list length mismatch: "
+                    f"target={len(target_ids)}, donor={len(donor_ids)}"
+                )
+            for idx, (target_tensor, donor_tensor) in enumerate(zip(target_ids, donor_ids)):
+                if target_tensor.shape != donor_tensor.shape:
+                    raise ValueError(
+                        "KV donor aligned prompt length mismatch after tokenization: "
+                        f"model_idx={idx}, target={tuple(target_tensor.shape)}, "
+                        f"donor={tuple(donor_tensor.shape)}, "
+                        f"donor={donor['subject']}#{donor['question_id']}"
+                    )
+        elif target_ids.shape != donor_ids.shape:
             raise ValueError(
                 "KV donor prompt length mismatch after tokenization: "
                 f"target={tuple(target_ids.shape)}, donor={tuple(donor_ids.shape)}, "
@@ -329,8 +380,50 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
             donor_inputs = evaluator._kv_ablation_pending_source_inputs
             input_ids = kwargs.get("input_ids")
             attention_mask = kwargs.get("attention_mask")
+            num_models = len(getattr(self_model, "model_list", []))
 
             if (
+                donor_inputs is not None
+                and isinstance(input_ids, list)
+                and len(input_ids) >= 2
+                and torch.is_tensor(input_ids[0])
+                and input_ids[0].ndim == 2
+                and input_ids[0].shape[1] > 1
+            ):
+                donor_ids = donor_inputs["input_ids"]
+                if not isinstance(donor_ids, list):
+                    raise ValueError("Aligned KV donor inputs must be a list")
+                new_input_ids = list(input_ids)
+                for model_idx in range(1, min(num_models, len(new_input_ids))):
+                    donor_idx = model_idx if model_idx < len(donor_ids) else len(donor_ids) - 1
+                    donor_tensor = donor_ids[donor_idx].to(device=new_input_ids[model_idx].device)
+                    if donor_tensor.shape != new_input_ids[model_idx].shape:
+                        raise ValueError(
+                            "KV donor aligned input_ids shape changed before Rosetta forward: "
+                            f"model_idx={model_idx}, target={tuple(new_input_ids[model_idx].shape)}, "
+                            f"donor={tuple(donor_tensor.shape)}"
+                        )
+                    new_input_ids[model_idx] = donor_tensor
+                kwargs["input_ids"] = new_input_ids
+
+                if isinstance(attention_mask, list):
+                    donor_masks = donor_inputs.get("attention_mask")
+                    if donor_masks is not None:
+                        if not isinstance(donor_masks, list):
+                            raise ValueError("Aligned KV donor attention_mask must be a list")
+                        new_attention_mask = list(attention_mask)
+                        for model_idx in range(1, min(num_models, len(new_attention_mask))):
+                            donor_idx = model_idx if model_idx < len(donor_masks) else len(donor_masks) - 1
+                            donor_mask = donor_masks[donor_idx]
+                            if donor_mask is not None:
+                                donor_mask = donor_mask.to(
+                                    device=new_attention_mask[model_idx].device,
+                                    dtype=new_attention_mask[model_idx].dtype,
+                                )
+                            new_attention_mask[model_idx] = donor_mask
+                        kwargs["attention_mask"] = new_attention_mask
+
+            elif (
                 donor_inputs is not None
                 and torch.is_tensor(input_ids)
                 and input_ids.ndim == 2
@@ -343,7 +436,6 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
                         f"target={tuple(input_ids.shape)}, donor={tuple(donor_ids.shape)}"
                     )
 
-                num_models = len(getattr(self_model, "model_list", []))
                 if num_models < 2:
                     return original_forward(*args, **kwargs)
 
@@ -364,6 +456,7 @@ class KVContentAblationEvaluator(BaseUnifiedEvaluator):
         model._kv_content_ablation_forward_patch = True
 
     def evaluate_subject(self, subject: str, model, tokenizer, device: torch.device, model_type: str = "hf", llm_tokenizer: Optional[Any] = None):
+        self._kv_ablation_llm_tokenizer = llm_tokenizer
         self._patch_rosetta_kv_content_ablation(model)
         result = super().evaluate_subject(subject, model, tokenizer, device, model_type, llm_tokenizer)
         cors, acc, probs, length_stats, cot_logs = result

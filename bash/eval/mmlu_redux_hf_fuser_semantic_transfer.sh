@@ -60,10 +60,16 @@ if [[ ! -f "${CHECKPOINT_DIR}/projector_config.json" ]]; then
   echo "Missing ${CHECKPOINT_DIR}/projector_config.json after download" >&2
   exit 1
 fi
+FUSER_CONFIG_PATH=${FUSER_CONFIG_PATH:-${HF_LOCAL_DIR}/${FUSER_SUBDIR}/config.json}
+if [[ ! -f "${FUSER_CONFIG_PATH}" ]]; then
+  echo "Missing ${FUSER_CONFIG_PATH} after download" >&2
+  exit 1
+fi
 
 export BASE_MODEL TEACHER_MODEL CHECKPOINT_DIR NORMAL_RESULT_DIR SWAP_RESULT_DIR NORMAL_CONFIG SWAP_CONFIG
-export KV_SWAP_SEED EVAL_GPU_IDS RUN_ID
+export KV_SWAP_SEED EVAL_GPU_IDS RUN_ID FUSER_CONFIG_PATH
 python - <<'PY'
+import json
 import os
 import yaml
 
@@ -71,17 +77,24 @@ def gpu_ids():
     return [int(part.strip()) for part in os.environ["EVAL_GPU_IDS"].split(",") if part.strip()]
 
 def base_config(output_dir, cache_suffix):
+    with open(os.environ["FUSER_CONFIG_PATH"]) as f:
+        fuser_config = json.load(f)
+    fuser_model_config = fuser_config.get("model", {})
+    rosetta_config = {
+        "base_model": os.environ["BASE_MODEL"],
+        "teacher_model": os.environ["TEACHER_MODEL"],
+        "is_do_alignment": bool(fuser_model_config.get("is_do_alignment", False)),
+        "alignment_strategy": fuser_model_config.get("alignment_strategy", "first"),
+        "checkpoints_dir": os.environ["CHECKPOINT_DIR"],
+        "include_response": bool(fuser_model_config.get("include_response", False)),
+    }
+    if fuser_model_config.get("multi_source_fusion_mode") is not None:
+        rosetta_config["multi_source_fusion_mode"] = fuser_model_config["multi_source_fusion_mode"]
+
     return {
         "model": {
             "model_name": "Rosetta",
-            "rosetta_config": {
-                "base_model": os.environ["BASE_MODEL"],
-                "teacher_model": os.environ["TEACHER_MODEL"],
-                "is_do_alignment": False,
-                "alignment_strategy": "first",
-                "checkpoints_dir": os.environ["CHECKPOINT_DIR"],
-                "include_response": False,
-            },
+            "rosetta_config": rosetta_config,
             "generation_config": {
                 "do_sample": False,
                 "max_new_tokens": 64,
