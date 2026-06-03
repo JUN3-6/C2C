@@ -1,0 +1,26 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen2.5-0.5B-Instruct
+    is_do_alignment: false
+    alignment_strategy: "first"
+    checkpoints_dir: local/hf_models/C2C_Fuser/qwen3_0.6b+qwen2.5_0.5b_Fuser/final
+    include_response: false
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/qwen3_0.6b_qwen2.5_0.5b_C2C_OpenHermes_Fuser_mmlu_redux
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0, 1]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  dataset_cache_dir: local/hf_datasets_cache/mmlu_redux_qwen3_0_6b_qwen2_5_0_5b_openhermes_fuser_eval
+  math_grading_method: "comprehensive"
