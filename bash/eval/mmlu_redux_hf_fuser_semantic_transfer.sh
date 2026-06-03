@@ -22,6 +22,8 @@ PY
 
 NORMAL_RESULT_DIR=${NORMAL_RESULT_DIR:-local/final_results/${RUN_ID}_mmlu_redux}
 SWAP_RESULT_DIR=${SWAP_RESULT_DIR:-local/final_results/${RUN_ID}_kv_content_global_exact_seed${KV_SWAP_SEED}_mmlu_redux}
+COMPARE_JSON=${COMPARE_JSON:-${SWAP_RESULT_DIR}/normal_vs_kv_content_swap_latest.json}
+FORCE_RERUN=${FORCE_RERUN:-0}
 CONFIG_DIR=${CONFIG_DIR:-local/tmp/hf_fuser_semantic_transfer_configs}
 NORMAL_CONFIG=${NORMAL_CONFIG:-${CONFIG_DIR}/${RUN_ID}_normal.yaml}
 SWAP_CONFIG=${SWAP_CONFIG:-${CONFIG_DIR}/${RUN_ID}_kv_content_global_exact_seed${KV_SWAP_SEED}.yaml}
@@ -42,6 +44,14 @@ echo "BASE_MODEL=${BASE_MODEL}"
 echo "TEACHER_MODEL=${TEACHER_MODEL}"
 echo "CHECKPOINT_DIR=${CHECKPOINT_DIR}"
 echo "RUN_ID=${RUN_ID}"
+echo "COMPARE_JSON=${COMPARE_JSON}"
+echo "FORCE_RERUN=${FORCE_RERUN}"
+
+if [[ "${FORCE_RERUN}" != "1" && -f "${COMPARE_JSON}" ]]; then
+  echo "[skip] Comparison JSON already exists: ${COMPARE_JSON}"
+  echo "Set FORCE_RERUN=1 to rerun this fuser."
+  exit 0
+fi
 
 if [[ ! -f "${CHECKPOINT_DIR}/projector_config.json" ]]; then
   echo "[download] Fetching ${HF_REPO}/${FUSER_SUBDIR} into ${HF_LOCAL_DIR}"
@@ -151,7 +161,7 @@ echo "[3/3] Paired normal-vs-swap comparison"
 python script/analysis/compare_normal_vs_kv_content_ablation.py \
   --normal-dir "${NORMAL_RESULT_DIR}" \
   --swap-dir "${SWAP_RESULT_DIR}" \
-  --output-json "${SWAP_RESULT_DIR}/normal_vs_kv_content_swap_latest.json"
+  --output-json "${COMPARE_JSON}"
 
 echo "[summary] Swap-only donor diagnostics"
 python script/analysis/analyze_kv_content_ablation_results.py \
