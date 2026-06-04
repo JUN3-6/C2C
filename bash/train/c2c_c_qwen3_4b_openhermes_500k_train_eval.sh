@@ -29,6 +29,8 @@ PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
 MAX_LENGTH=${MAX_LENGTH:-2048}
 NUM_SAMPLES=${NUM_SAMPLES:-500000}
 WANDB_MODE=${WANDB_MODE:-disabled}
+WANDB_PROJECT=${WANDB_PROJECT:-C2C}
+WANDB_ENTITY=${WANDB_ENTITY:-}
 
 mkdir -p "${LOG_DIR}" "${TMP_DIR}" "${RESULT_DIR}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -79,7 +81,7 @@ fi
 
 export TRAIN_TEMPLATE TRAIN_CONFIG EVAL_CONFIG CHECKPOINT_ROOT CHECKPOINT_DIR RESULT_DIR
 export RUN_ID NPROC_PER_NODE PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS
-export MAX_LENGTH NUM_SAMPLES WANDB_MODE EVAL_GPU_IDS
+export MAX_LENGTH NUM_SAMPLES WANDB_MODE WANDB_PROJECT WANDB_ENTITY EVAL_GPU_IDS
 
 python - <<'PY'
 import json
@@ -98,6 +100,8 @@ train_cfg["training"]["gradient_accumulation_steps"] = int(os.environ["GRADIENT_
 train_cfg["training"]["max_length"] = int(os.environ["MAX_LENGTH"])
 train_cfg["output"]["output_dir"] = os.environ["CHECKPOINT_ROOT"]
 train_cfg["output"]["wandb_config"]["mode"] = os.environ["WANDB_MODE"]
+train_cfg["output"]["wandb_config"]["project"] = os.environ["WANDB_PROJECT"]
+train_cfg["output"]["wandb_config"]["entity"] = os.environ["WANDB_ENTITY"] or None
 train_cfg["output"]["wandb_config"]["run_name"] = os.environ["RUN_ID"]
 train_cfg["data"]["kwargs"]["num_samples"] = int(os.environ["NUM_SAMPLES"])
 train_cfg["data"]["kwargs"]["max_word_count"] = int(os.environ["MAX_LENGTH"])
