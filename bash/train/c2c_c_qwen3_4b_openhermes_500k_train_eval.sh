@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)
+  else
+    CUDA_VISIBLE_DEVICES=0
+  fi
+fi
+export CUDA_VISIBLE_DEVICES
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
