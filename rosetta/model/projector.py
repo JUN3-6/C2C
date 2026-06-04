@@ -1210,8 +1210,8 @@ class C2CComplexProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
