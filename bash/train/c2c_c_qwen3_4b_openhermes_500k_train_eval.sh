@@ -31,6 +31,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-500000}
 WANDB_MODE=${WANDB_MODE:-disabled}
 WANDB_PROJECT=${WANDB_PROJECT:-C2C}
 WANDB_ENTITY=${WANDB_ENTITY:-}
+LOSS_CHUNK_SIZE=${LOSS_CHUNK_SIZE:-128}
 
 mkdir -p "${LOG_DIR}" "${TMP_DIR}" "${RESULT_DIR}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -82,6 +83,7 @@ fi
 export TRAIN_TEMPLATE TRAIN_CONFIG EVAL_CONFIG CHECKPOINT_ROOT CHECKPOINT_DIR RESULT_DIR
 export RUN_ID NPROC_PER_NODE PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS
 export MAX_LENGTH NUM_SAMPLES WANDB_MODE WANDB_PROJECT WANDB_ENTITY EVAL_GPU_IDS
+export LOSS_CHUNK_SIZE
 
 python - <<'PY'
 import json
@@ -98,6 +100,7 @@ train_cfg["training"]["num_processes"] = int(os.environ["NPROC_PER_NODE"])
 train_cfg["training"]["per_device_train_batch_size"] = int(os.environ["PER_DEVICE_TRAIN_BATCH_SIZE"])
 train_cfg["training"]["gradient_accumulation_steps"] = int(os.environ["GRADIENT_ACCUMULATION_STEPS"])
 train_cfg["training"]["max_length"] = int(os.environ["MAX_LENGTH"])
+train_cfg["training"]["loss_chunk_size"] = int(os.environ["LOSS_CHUNK_SIZE"])
 train_cfg["output"]["output_dir"] = os.environ["CHECKPOINT_ROOT"]
 train_cfg["output"]["wandb_config"]["mode"] = os.environ["WANDB_MODE"]
 train_cfg["output"]["wandb_config"]["project"] = os.environ["WANDB_PROJECT"]
