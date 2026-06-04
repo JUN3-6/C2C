@@ -20,7 +20,8 @@
                 "initial_temperature": 1.0,
                 "final_temperature": 0.001,
                 "anneal_steps": 1929,
-                "scalar_temperature": 1.0
+                "scalar_temperature": 1.0,
+                "use_checkpoint": true
             }
         },
         "mapping": "last_aligned"

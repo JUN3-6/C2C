@@ -4,6 +4,7 @@ Projector nn module for the unified memory
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from torch import Tensor
 from transformers import Cache, DynamicCache
 from typing import Optional, Tuple, Literal, Union, List
@@ -1057,6 +1058,7 @@ class C2CComplexProjector(Projector):
         dtype: torch.dtype = torch.float32,
         gate_init: float = 0.0,
         zero_init: bool = False,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -1073,6 +1075,7 @@ class C2CComplexProjector(Projector):
         self.target_num_heads = target_num_heads
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
+        self.use_checkpoint = use_checkpoint
 
         source_flat_dim = source_dim * source_num_heads
         target_flat_dim = target_dim * target_num_heads
@@ -1159,6 +1162,11 @@ class C2CComplexProjector(Projector):
         temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
         self.gate_temperature.fill_(temp)
 
+    def _maybe_checkpoint(self, fn, *args):
+        if self.training and self.use_checkpoint:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
     def forward(
         self,
         source_kv: Tuple[Tensor, Tensor],
@@ -1181,14 +1189,14 @@ class C2CComplexProjector(Projector):
         target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
         target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
 
-        projected_source_key = self.key_source_projection(source_key_flat)
-        projected_source_value = self.value_source_projection(source_value_flat)
+        projected_source_key = self._maybe_checkpoint(self.key_source_projection, source_key_flat)
+        projected_source_value = self._maybe_checkpoint(self.value_source_projection, source_value_flat)
 
         key_joint = torch.cat([projected_source_key, target_key_flat], dim=-1)
         value_joint = torch.cat([projected_source_value, target_value_flat], dim=-1)
 
-        key_hidden = self.key_fusion(self.key_fusion_in(key_joint))
-        value_hidden = self.value_fusion(self.value_fusion_in(value_joint))
+        key_hidden = self._maybe_checkpoint(lambda x: self.key_fusion(self.key_fusion_in(x)), key_joint)
+        value_hidden = self._maybe_checkpoint(lambda x: self.value_fusion(self.value_fusion_in(x)), value_joint)
 
         projected_key_flat = self.key_proj_out(key_hidden)
         projected_value_flat = self.value_proj_out(value_hidden)
