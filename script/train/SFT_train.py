@@ -865,7 +865,8 @@ def main():
     # ------------------------------------------------------------------
     print("Starting training…")
     global_step = 0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+    empty_cache_after_step = training_config.get("empty_cache_after_step", True)
     for epoch in range(training_config["num_epochs"]):
         if distributed and train_sampler is not None:
             # Ensure different shuffles across epochs in distributed setup
@@ -905,7 +906,9 @@ def main():
                 grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+                if empty_cache_after_step and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 global_step += 1
                 macro_step_in_epoch += 1
 
