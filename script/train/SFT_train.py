@@ -505,40 +505,44 @@ def train_step(
         labels = batch["labels"].to(device)
         kv_cache_index = [x.to(device) for x in batch["kv_cache_index"]]
         
-        # Forward pass for Rosetta model. Compute the LM loss outside the HF
-        # model in small chunks to avoid peak memory spikes on long samples.
+        use_hf_internal_loss = loss_type in {"hf_internal", "hf", "original"}
+
         outputs = model.forward(
             kv_cache_index=kv_cache_index,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            labels=None,
+            labels=labels if use_hf_internal_loss else None,
             use_cache=True
         )
 
-        base_input_ids = input_ids[0] if isinstance(input_ids, list) else input_ids
-        base_attention_mask = attention_mask[0] if isinstance(attention_mask, list) else attention_mask
-        suffix_len = outputs.logits.size(1)
-        if loss_type == "paper_suffix_lm":
-            suffix_len = outputs.logits.size(1)
-            suffix_input_ids = base_input_ids[:, -suffix_len:]
-            suffix_attention_mask = base_attention_mask[:, -suffix_len:] if base_attention_mask is not None else None
-            loss = _paper_suffix_lm_loss(
-                outputs.logits,
-                suffix_input_ids,
-                suffix_attention_mask,
-                model,
-                chunk_size=loss_chunk_size,
-            )
+        if use_hf_internal_loss:
+            loss = outputs.loss
         else:
-            suffix_labels = labels[:, -suffix_len:]
-            loss = _paper_suffix_lm_loss(
-                outputs.logits,
-                suffix_labels,
-                None,
-                model,
-                chunk_size=loss_chunk_size,
-            )
+            # Compute the LM loss outside the HF model in small chunks to
+            # avoid peak memory spikes on long samples.
+            base_input_ids = input_ids[0] if isinstance(input_ids, list) else input_ids
+            base_attention_mask = attention_mask[0] if isinstance(attention_mask, list) else attention_mask
+            suffix_len = outputs.logits.size(1)
+            if loss_type == "paper_suffix_lm":
+                suffix_input_ids = base_input_ids[:, -suffix_len:]
+                suffix_attention_mask = base_attention_mask[:, -suffix_len:] if base_attention_mask is not None else None
+                loss = _paper_suffix_lm_loss(
+                    outputs.logits,
+                    suffix_input_ids,
+                    suffix_attention_mask,
+                    model,
+                    chunk_size=loss_chunk_size,
+                )
+            else:
+                suffix_labels = labels[:, -suffix_len:]
+                loss = _paper_suffix_lm_loss(
+                    outputs.logits,
+                    suffix_labels,
+                    None,
+                    model,
+                    chunk_size=loss_chunk_size,
+                )
 
         if loss is not None and not loss.requires_grad:
             loss = loss + _zero_trainable_loss(model).to(loss.device)

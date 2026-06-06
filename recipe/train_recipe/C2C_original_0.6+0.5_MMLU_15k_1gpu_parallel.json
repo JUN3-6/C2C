@@ -31,7 +31,8 @@
         "per_device_train_batch_size": 4,
         "num_processes": 1,
         "freeze": ["teacher", "base"],
-        "seed": 42
+        "seed": 42,
+        "loss_type": "hf_internal"
     },
     "output": {
         "output_dir": "local/checkpoints/0.6+0.5B_C2C_original_MMLU_15k_1gpu_parallel",
