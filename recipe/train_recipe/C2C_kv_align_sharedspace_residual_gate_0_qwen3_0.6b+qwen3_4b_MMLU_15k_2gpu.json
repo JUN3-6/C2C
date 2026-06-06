@@ -31,21 +31,21 @@
         "scheduler_type": "linear",
         "warmup_ratio": 0.1,
         "max_grad_norm": 1.0,
-        "gradient_accumulation_steps": 4,
-        "per_device_train_batch_size": 8,
+        "gradient_accumulation_steps": 8,
+        "per_device_train_batch_size": 4,
         "num_processes": 2,
         "freeze": ["teacher", "base"],
         "seed": 42
     },
     "output": {
-        "output_dir": "local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_kv_align_sharedspace_residual_MMLU_15k_gate_0_bs8_2gpu",
+        "output_dir": "local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_kv_align_sharedspace_residual_MMLU_15k_gate_0_bs4_2gpu",
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
             "project": "C2C",
             "mode": "online",
             "entity": "june6-hanyang-university",
-            "run_name": "qwen3_0.6b_qwen3_4b_C2C_kv_align_sharedspace_residual_MMLU_15k_gate_0_bs8_2gpu"
+            "run_name": "qwen3_0.6b_qwen3_4b_C2C_kv_align_sharedspace_residual_MMLU_15k_gate_0_bs4_2gpu"
         }
     },
     "data": {
@@ -54,7 +54,7 @@
             "split": "auxiliary_train",
             "max_word_count": 1024,
             "num_samples": 15000,
-            "cache_dir": "local/hf_datasets_cache/mmlu_qwen3_0_6b_qwen3_4b_sharedspace_residual_gate_0_15k_bs8_2gpu"
+            "cache_dir": "local/hf_datasets_cache/mmlu_qwen3_0_6b_qwen3_4b_sharedspace_residual_gate_0_15k_bs4_2gpu"
         },
         "train_ratio": 0.99
     }

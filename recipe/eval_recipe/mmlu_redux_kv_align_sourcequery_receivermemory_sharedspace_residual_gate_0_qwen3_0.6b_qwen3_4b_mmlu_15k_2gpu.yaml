@@ -5,7 +5,7 @@ model:
     teacher_model: Qwen/Qwen3-4B
     is_do_alignment: false
     alignment_strategy: "first"
-    checkpoints_dir: local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_kv_align_sourcequery_receivermemory_sharedspace_residual_MMLU_15k_gate_0_bs8_2gpu/final
+    checkpoints_dir: local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_kv_align_sourcequery_receivermemory_sharedspace_residual_MMLU_15k_gate_0_bs4_2gpu/final
     include_response: false
 
   generation_config:
@@ -13,7 +13,7 @@ model:
     max_new_tokens: 64
 
 output:
-  output_dir: local/final_results/qwen3_0.6b_qwen3_4b_C2C_kv_align_sourcequery_receivermemory_sharedspace_residual_MMLU_15k_gate_0_bs8_2gpu_mmlu_redux
+  output_dir: local/final_results/qwen3_0.6b_qwen3_4b_C2C_kv_align_sourcequery_receivermemory_sharedspace_residual_MMLU_15k_gate_0_bs4_2gpu_mmlu_redux
 
 eval:
   dataset: mmlu-redux
@@ -22,5 +22,5 @@ eval:
   use_cot: false
   use_template: true
   sample_interval: 1
-  dataset_cache_dir: local/hf_datasets_cache/mmlu_redux_qwen3_0_6b_qwen3_4b_sourcequery_receivermemory_sharedspace_residual_gate_0_bs8_2gpu_eval
+  dataset_cache_dir: local/hf_datasets_cache/mmlu_redux_qwen3_0_6b_qwen3_4b_sourcequery_receivermemory_sharedspace_residual_gate_0_bs4_2gpu_eval
   math_grading_method: "comprehensive"
