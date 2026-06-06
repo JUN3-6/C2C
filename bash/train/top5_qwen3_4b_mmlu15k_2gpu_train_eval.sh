@@ -6,9 +6,9 @@ export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-29620}
-LOG_DIR=${LOG_DIR:-local/logs/top5_qwen3_4b_mmlu15k_2gpu_train_eval}
+LOG_DIR=${LOG_DIR:-local/logs/top5_qwen3_4b_mmlu15k_bs8_2gpu_train_eval}
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
-LOG_FILE=${LOG_FILE:-${LOG_DIR}/top5_qwen3_4b_mmlu15k_2gpu_train_eval_${TIMESTAMP}.log}
+LOG_FILE=${LOG_FILE:-${LOG_DIR}/top5_qwen3_4b_mmlu15k_bs8_2gpu_train_eval_${TIMESTAMP}.log}
 
 mkdir -p "${LOG_DIR}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
