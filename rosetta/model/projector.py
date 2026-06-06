@@ -595,7 +595,7 @@ class AllInOneProjector(Projector):
             gumbel_noise = self._sample_gumbel(gate_logit.shape, gate_logit.device, gate_logit.dtype)
             return torch.sigmoid((gate_logit + gumbel_noise) / self.gate_temperature)
         else:
-            return (gate_logit > 0).float()
+            return (gate_logit > 0).to(dtype=gate_logit.dtype)
     
     @staticmethod
     def _sample_gumbel(shape: tuple, device: torch.device, dtype: torch.dtype, eps: float = 1e-20) -> Tensor:
@@ -999,8 +999,8 @@ class C2CProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         # Normalize scalars (scalar_temperature=1.0)
         norm_key_scalar = torch.sigmoid(key_scalar)
@@ -1388,8 +1388,8 @@ class C2CLCFProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
@@ -1550,8 +1550,8 @@ class C2CKVAlignmentProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
@@ -1851,8 +1851,8 @@ class C2CKVAlignmentCrossAttentionProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
@@ -3219,8 +3219,8 @@ class C2CKVAlignmentNoResidualProjector(C2CKVAlignmentProjector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
 
         norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
         norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)

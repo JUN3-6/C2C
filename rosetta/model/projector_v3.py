@@ -243,8 +243,8 @@ class C2CHiddenStateProjector(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
         _nvtx_pop()
 
         _nvtx_push("fuser_v3.dynamic_weight_norm")
@@ -478,8 +478,8 @@ class C2CHiddenConcatProjectorV3(Projector):
             key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
             value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
         else:
-            key_gate = (key_gate_logit > 0).float()
-            value_gate = (value_gate_logit > 0).float()
+            key_gate = (key_gate_logit > 0).to(dtype=target_key.dtype)
+            value_gate = (value_gate_logit > 0).to(dtype=target_value.dtype)
         _nvtx_pop()
 
         _nvtx_push("fuser_v3.dynamic_weight_norm")
