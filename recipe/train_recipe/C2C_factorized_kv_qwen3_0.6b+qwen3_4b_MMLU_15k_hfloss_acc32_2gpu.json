@@ -1,0 +1,65 @@
+{
+    "model": {
+        "base_model": "Qwen/Qwen3-0.6B",
+        "teacher_model": "Qwen/Qwen3-4B",
+        "is_do_alignment": false,
+        "alignment_strategy": "first",
+        "include_response": false,
+        "projector": {
+            "type": "C2CFactorizedKVProjector",
+            "params": {
+                "hidden_dim": 1024,
+                "intermediate_dim": 2048,
+                "num_layers": 5,
+                "basis_rank": 32,
+                "dropout": 0.1,
+                "initial_temperature": 1.0,
+                "final_temperature": 0.001,
+                "anneal_steps": 1929,
+                "scalar_temperature": 1.0,
+                "basis_scale": 0.02
+            }
+        },
+        "mapping": "last_aligned"
+    },
+    "training": {
+        "learning_rate": 0.0001,
+        "weight_decay": 0.01,
+        "num_epochs": 1,
+        "max_length": 1024,
+        "device": "cuda",
+        "scheduler_type": "linear",
+        "warmup_ratio": 0.1,
+        "max_grad_norm": 1.0,
+        "gradient_accumulation_steps": 32,
+        "per_device_train_batch_size": 4,
+        "num_processes": 2,
+        "freeze": [
+            "teacher",
+            "base"
+        ],
+        "seed": 42,
+        "loss_type": "hf_internal"
+    },
+    "output": {
+        "output_dir": "local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_factorized_kv_MMLU_15k_rank32_hfloss_acc32_bs4_2gpu",
+        "save_steps": 500,
+        "eval_steps": 100,
+        "wandb_config": {
+            "project": "C2C",
+            "mode": "online",
+            "entity": "june6-hanyang-university",
+            "run_name": "qwen3_0.6b_qwen3_4b_C2C_factorized_kv_MMLU_15k_rank32_hfloss_acc32_bs4_2gpu"
+        }
+    },
+    "data": {
+        "type": "MMLUChatDataset",
+        "kwargs": {
+            "split": "auxiliary_train",
+            "max_word_count": 1024,
+            "num_samples": 15000,
+            "cache_dir": "local/hf_datasets_cache/mmlu_qwen3_0_6b_qwen3_4b_factorized_kv_15k_rank32_hfloss_acc32_bs4_2gpu"
+        },
+        "train_ratio": 0.99
+    }
+}

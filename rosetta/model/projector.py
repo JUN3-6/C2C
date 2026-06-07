@@ -1026,6 +1026,232 @@ class C2CProjector(Projector):
 
 @register_model
 @capture_init_args
+class C2CFactorizedKVProjector(Projector):
+    """
+    C2C-style projector that predicts target KV deltas through a learned
+    low-rank head-wise basis instead of directly emitting H_t * D_t channels.
+
+    For each target token/head it predicts R coefficients, then reconstructs
+    the target-head vector with a learned basis:
+
+        delta_k[b,h,n,d] = sum_r coeff_k[b,n,h,r] * basis_k[h,r,d]
+
+    This keeps the original C2C input contract and residual/gate/weight path,
+    but constrains the output KV space with a structured low-rank basis.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        basis_rank: int = 32,
+        intermediate_dim: int = 1024,
+        hidden_dim: int = 1024,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 1929,
+        scalar_temperature: float = 1.0,
+        basis_scale: float = 0.02,
+        dtype: torch.dtype = torch.float32,
+        zero_init: bool = False,
+    ):
+        super().__init__()
+
+        if num_layers < 3:
+            raise ValueError("num_layers must be >= 3")
+        if basis_rank < 1:
+            raise ValueError("basis_rank must be >= 1")
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.basis_rank = basis_rank
+        self.hidden_dim = hidden_dim
+
+        in_dim = source_dim * source_num_heads
+        out_dim = target_dim * target_num_heads
+        coeff_dim = target_num_heads * basis_rank
+
+        self.key_in = nn.Linear(in_dim + out_dim, hidden_dim, bias=True, dtype=dtype)
+        self.value_in = nn.Linear(in_dim + out_dim, hidden_dim, bias=True, dtype=dtype)
+
+        self.key_mlp1 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=1,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.value_mlp1 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=1,
+            dropout=dropout,
+            dtype=dtype,
+        )
+
+        self.key_scalar_mlp2 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=hidden_dim,
+            num_layers=1,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.value_scalar_mlp2 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=hidden_dim,
+            num_layers=1,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.key_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+
+        self.key_coeff_mlp2 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers - 2,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.value_coeff_mlp2 = RegularMLP(
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            num_layers=num_layers - 2,
+            dropout=dropout,
+            dtype=dtype,
+        )
+        self.key_coeff_out = nn.Linear(hidden_dim, coeff_dim, bias=True, dtype=dtype)
+        self.value_coeff_out = nn.Linear(hidden_dim, coeff_dim, bias=True, dtype=dtype)
+
+        self.key_basis = nn.Parameter(torch.empty(target_num_heads, basis_rank, target_dim, dtype=dtype))
+        self.value_basis = nn.Parameter(torch.empty(target_num_heads, basis_rank, target_dim, dtype=dtype))
+        self.key_bias = nn.Parameter(torch.zeros(target_num_heads, 1, target_dim, dtype=dtype))
+        self.value_bias = nn.Parameter(torch.zeros(target_num_heads, 1, target_dim, dtype=dtype))
+        nn.init.normal_(self.key_basis, mean=0.0, std=basis_scale)
+        nn.init.normal_(self.value_basis, mean=0.0, std=basis_scale)
+
+        if zero_init:
+            nn.init.zeros_(self.key_coeff_out.weight)
+            nn.init.zeros_(self.key_coeff_out.bias)
+            nn.init.zeros_(self.value_coeff_out.weight)
+            nn.init.zeros_(self.value_coeff_out.bias)
+
+        self.key_gate_logit = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.use_gumbel = True
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+        self.scalar_temperature = scalar_temperature
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def _gate(self, gate_logit: Tensor, batch_size: int, num_heads: int, seq_len: int, dtype: torch.dtype) -> Tensor:
+        gate_logit = gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u = torch.rand(
+                batch_size,
+                num_heads,
+                seq_len,
+                1,
+                device=gate_logit.device,
+                dtype=gate_logit.dtype,
+            )
+            g = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            return torch.sigmoid((gate_logit + g) / self.gate_temperature)
+        return (gate_logit > 0).to(dtype=dtype)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        batch_size, source_heads, seq_len, source_head_dim = source_key.shape
+        _, target_heads, target_seq_len, target_head_dim = target_key.shape
+
+        if target_seq_len != seq_len:
+            raise ValueError(
+                "source and target KV sequence lengths must match; "
+                f"got {seq_len} and {target_seq_len}"
+            )
+        if source_heads != self.source_num_heads or source_head_dim != self.source_dim:
+            raise ValueError(
+                "source KV shape does not match projector config; "
+                f"got heads={source_heads}, dim={source_head_dim}, "
+                f"expected heads={self.source_num_heads}, dim={self.source_dim}"
+            )
+        if target_heads != self.target_num_heads or target_head_dim != self.target_dim:
+            raise ValueError(
+                "target KV shape does not match projector config; "
+                f"got heads={target_heads}, dim={target_head_dim}, "
+                f"expected heads={self.target_num_heads}, dim={self.target_dim}"
+            )
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(batch_size, seq_len, source_heads * source_head_dim)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(batch_size, seq_len, source_heads * source_head_dim)
+        target_key_flat = target_key.transpose(1, 2).contiguous().view(batch_size, seq_len, target_heads * target_head_dim)
+        target_value_flat = target_value.transpose(1, 2).contiguous().view(batch_size, seq_len, target_heads * target_head_dim)
+
+        key_hidden = self.key_in(torch.cat([source_key_flat, target_key_flat], dim=-1))
+        value_hidden = self.value_in(torch.cat([source_value_flat, target_value_flat], dim=-1))
+
+        key_hidden = self.key_mlp1(key_hidden)
+        value_hidden = self.value_mlp1(value_hidden)
+
+        key_coeff = self.key_coeff_out(self.key_coeff_mlp2(key_hidden))
+        value_coeff = self.value_coeff_out(self.value_coeff_mlp2(value_hidden))
+        key_coeff = key_coeff.view(batch_size, seq_len, target_heads, self.basis_rank)
+        value_coeff = value_coeff.view(batch_size, seq_len, target_heads, self.basis_rank)
+
+        projected_key = torch.einsum("bnhr,hrd->bhnd", key_coeff, self.key_basis)
+        projected_value = torch.einsum("bnhr,hrd->bhnd", value_coeff, self.value_basis)
+        projected_key = projected_key + self.key_bias.unsqueeze(0)
+        projected_value = projected_value + self.value_bias.unsqueeze(0)
+
+        key_scalar = self.key_scalar_head(self.key_scalar_mlp2(key_hidden))
+        value_scalar = self.value_scalar_head(self.value_scalar_mlp2(value_hidden))
+        key_scalar = key_scalar.permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = value_scalar.permute(0, 2, 1).unsqueeze(-1)
+
+        key_gate = self._gate(self.key_gate_logit, batch_size, target_heads, seq_len, target_key.dtype)
+        value_gate = self._gate(self.value_gate_logit, batch_size, target_heads, seq_len, target_value.dtype)
+
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        output_key = target_key + key_gate * norm_key_scalar * projected_key
+        output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            pass
+
+        return output_key, output_value
+
+register_model("FactorizedKVProjector")(C2CFactorizedKVProjector)
+register_model("C2CFactorizedProjector")(C2CFactorizedKVProjector)
+
+@register_model
+@capture_init_args
 class C2CComplexProjector(Projector):
     """
     Complex C2C-C projector described in the paper appendix.
