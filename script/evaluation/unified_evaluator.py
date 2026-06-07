@@ -329,7 +329,14 @@ class UnifiedEvaluator:
         except Exception as e:
             print(f"Failed to dump bad sample for {subject} #{question_id}: {e}")
     
-    def format_example(self, example: Dict[str, Any], use_cot: bool = True) -> str:
+    def format_example(
+        self,
+        example: Dict[str, Any],
+        use_cot: bool = True,
+        subject: Optional[str] = None,
+        tokenizer: Optional[AutoTokenizer] = None,
+        use_template: bool = True,
+    ) -> str:
         """
         Format an example into a prompt.
         
@@ -341,23 +348,25 @@ class UnifiedEvaluator:
             Formatted prompt string
         """
         if self.dataset_name == "mmmlu":
-            return self._format_mmmlu_example(example, use_cot)
+            return self._format_mmmlu_example(example, use_cot, subject=subject, use_template=use_template)
         elif self.dataset_name == "mmlu-redux":
-            return self._format_mmlu_redux_example(example, use_cot)
+            return self._format_mmlu_redux_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "gpqa":
-            return self._format_gpqa_example(example, use_cot)
+            return self._format_gpqa_example(example, use_cot, use_template=use_template)
         elif self.dataset_name in ["math-500", "gsm8k"]:
-            return self._format_math_problem_example(example, use_cot)
+            return self._format_math_problem_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "openbookqa":
-            return self._format_openbookqa_example(example, use_cot)
+            return self._format_openbookqa_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "ai2-arc":
-            return self._format_ai2_arc_example(example, use_cot)
+            return self._format_ai2_arc_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "mmlu-pro":
-            return self._format_mmlu_pro_example(example, use_cot)
+            return self._format_mmlu_pro_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "ceval":
-            return self._format_ceval_example(example, use_cot)
+            return self._format_ceval_example(example, use_cot, use_template=use_template)
         elif self.dataset_name == "longbench":
-            return self._format_longbench_example(example)
+            if tokenizer is None:
+                raise ValueError("tokenizer is required to format LongBench examples")
+            return self._format_longbench_example(example, tokenizer)
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
     
@@ -820,10 +829,46 @@ class UnifiedEvaluator:
         
         return segments
 
+    def _match_tokenized_length(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        target_length: int,
+        tokenizer,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad or truncate tokenized sharer inputs to the receiver sequence length."""
+        current_length = input_ids.shape[1]
+        if current_length == target_length:
+            return input_ids, attention_mask
+
+        if current_length > target_length:
+            return input_ids[:, :target_length], attention_mask[:, :target_length]
+
+        pad_length = target_length - current_length
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        pad_ids = torch.full(
+            (input_ids.shape[0], pad_length),
+            pad_token_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        pad_mask = torch.zeros(
+            (attention_mask.shape[0], pad_length),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        return torch.cat([input_ids, pad_ids], dim=1), torch.cat([attention_mask, pad_mask], dim=1)
+
     def prepare_model_inputs(self, prompt: str, tokenizer, device: torch.device,
                               model_type: str, llm_tokenizer: Optional[Any],
                               answer_method: str, proportion: float = 1.0, 
-                              order_mode: str = "front"):
+                              order_mode: str = "front",
+                              sharer_prompt: Optional[str] = None):
         """
         Prepare model inputs (input_ids, attention_mask, position_ids, kv_cache_index) for
         both HF and Rosetta models, separated from the generation stage.
@@ -843,6 +888,7 @@ class UnifiedEvaluator:
         - printable_text (str): chat-formatted input text for logging
         """
         messages = [{"role": "user", "content": prompt}]
+        sharer_messages = [{"role": "user", "content": sharer_prompt}] if sharer_prompt is not None else None
 
         use_aligner = (model_type == "rosetta") and (llm_tokenizer is not None)
 
@@ -858,6 +904,16 @@ class UnifiedEvaluator:
                 # Use custom response text if provided, otherwise default
                 response_text = self.eval_config.get("response_text", "The correct answer is")
                 text += response_text
+                if sharer_messages is not None:
+                    sharer_text = tokenizer.apply_chat_template(
+                        sharer_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False
+                    )
+                    sharer_text += response_text
+                else:
+                    sharer_text = None
                 response_length = tokenizer(response_text, add_special_tokens=False).input_ids.__len__()
             else: # generate
                 
@@ -867,6 +923,15 @@ class UnifiedEvaluator:
                     add_generation_prompt=True,
                     enable_thinking=False
                 )
+                if sharer_messages is not None:
+                    sharer_text = tokenizer.apply_chat_template(
+                        sharer_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False
+                    )
+                else:
+                    sharer_text = None
                 response_length = 1
             # Default HF/Qwen path (and Rosetta generate path)
             tokenized = tokenizer(text, return_tensors="pt").to(device)
@@ -898,6 +963,18 @@ class UnifiedEvaluator:
                 else:
                     outputs['inputs']["position_ids"] = attention_mask.long().cumsum(-1) - 1
                 outputs['inputs']['kv_cache_index'] = kv_cache_list
+
+                if sharer_text is not None:
+                    sharer_tokenized = tokenizer(sharer_text, return_tensors="pt").to(device)
+                    sharer_input_ids, sharer_attention_mask = self._match_tokenized_length(
+                        sharer_tokenized["input_ids"],
+                        sharer_tokenized["attention_mask"],
+                        input_ids.shape[1],
+                        tokenizer,
+                    )
+                    outputs['inputs']["input_ids"] = [input_ids, sharer_input_ids]
+                    outputs['inputs']["attention_mask"] = [attention_mask, sharer_attention_mask]
+                    outputs["printable_text"] = (text, sharer_text)
             
         # Rosetta logits path with alignment (dual tokenizers)
         # TODO: add rosetta proportion for aligner
@@ -926,17 +1003,34 @@ class UnifiedEvaluator:
                 enable_thinking=False,
                 remove_last_surfix=remove_last_surfix
             )
+            source_details = details
+            if sharer_messages is not None:
+                source_details = aligner.align_chat_messages(
+                    sharer_messages,
+                    add_generation_prompt=add_generation_prompt,
+                    return_details=True,
+                    enable_thinking=False,
+                    remove_last_surfix=remove_last_surfix
+                )
 
             slm_ids = torch.tensor(details['slm_ids_padded']).unsqueeze(0).to(device)
-            llm_ids = torch.tensor(details['llm_ids_padded']).unsqueeze(0).to(device)
+            llm_ids = torch.tensor(source_details['llm_ids_padded']).unsqueeze(0).to(device)
 
-            assert slm_ids.shape == llm_ids.shape, f"SLM and LLM input lengths do not match: {slm_ids.shape} vs {llm_ids.shape}"
+            if sharer_messages is None:
+                assert slm_ids.shape == llm_ids.shape, f"SLM and LLM input lengths do not match: {slm_ids.shape} vs {llm_ids.shape}"
 
             slm_pad_mask = torch.tensor(details['slm_padding_mask']).unsqueeze(0)
-            llm_pad_mask = torch.tensor(details['llm_padding_mask']).unsqueeze(0)
+            llm_pad_mask = torch.tensor(source_details['llm_padding_mask']).unsqueeze(0)
 
             slm_attention_mask = (~slm_pad_mask).float()
             llm_attention_mask = (~llm_pad_mask).float()
+            if sharer_messages is not None:
+                llm_ids, llm_attention_mask = self._match_tokenized_length(
+                    llm_ids,
+                    llm_attention_mask.to(device),
+                    slm_ids.shape[1],
+                    llm_tokenizer,
+                )
 
             message_mask = torch.tensor(details['message_mask'])
             
@@ -977,7 +1071,7 @@ class UnifiedEvaluator:
                     "position_ids": position_ids,
                     "kv_cache_index": kv_cache_list,
                 },
-                "printable_text": (details["slm_text"], details["llm_text"])
+                "printable_text": (details["slm_text"], source_details["llm_text"])
             }
 
         return outputs
@@ -1102,10 +1196,24 @@ class UnifiedEvaluator:
             start = 0 if start is None else int(start)
             end = len(test_data) if end is None else int(end)
             sample_indices = [i for i in sample_indices if start <= i < end]
+
+        mismatch_cfg = self.eval_config.get("sharer_mismatch", {})
+        if isinstance(mismatch_cfg, bool):
+            mismatch_enabled = mismatch_cfg
+            mismatch_offset = 1
+        elif isinstance(mismatch_cfg, dict):
+            mismatch_enabled = bool(mismatch_cfg.get("enabled", False))
+            mismatch_offset = int(mismatch_cfg.get("offset", 1))
+        else:
+            mismatch_enabled = False
+            mismatch_offset = 1
         
-        for i in tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})"):
+        for sample_pos, i in enumerate(tqdm(sample_indices, desc=f"Evaluating {subject} ({self.eval_config['answer_method']})")):
             try:
                 example = test_data[i]
+                sharer_prompt = None
+                sharer_mismatch_question_id = None
+                sharer_mismatch_true_answer = None
                 
                 if self.dataset_name != "longbench":
                     true_answer = self.parse_answer(example)
@@ -1120,27 +1228,28 @@ class UnifiedEvaluator:
                         skip_count += 1
                         continue
 
-                # Format prompt (pass subject for locale-aware templates)
-                if self.dataset_name == "mmmlu":
-                    prompt = self._format_mmmlu_example(example, use_cot=self.eval_config["use_cot"], subject=subject, use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "mmlu-redux":
-                    prompt = self._format_mmlu_redux_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "gpqa":
-                    prompt = self._format_gpqa_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name in ["math-500", "gsm8k"]:
-                    prompt = self._format_math_problem_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "openbookqa":
-                    prompt = self._format_openbookqa_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "ai2-arc":
-                    prompt = self._format_ai2_arc_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "mmlu-pro":
-                    prompt = self._format_mmlu_pro_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "ceval":
-                    prompt = self._format_ceval_example(example, use_cot=self.eval_config["use_cot"], use_template=self.eval_config["use_template"])
-                elif self.dataset_name == "longbench":
-                    prompt = self._format_longbench_example(example, tokenizer) 
-                else:
-                    raise ValueError(f"Unknown dataset: {self.dataset_name}")
+                prompt = self.format_example(
+                    example,
+                    use_cot=self.eval_config["use_cot"],
+                    subject=subject,
+                    tokenizer=tokenizer,
+                    use_template=self.eval_config["use_template"],
+                )
+                if mismatch_enabled and model_type == "rosetta" and len(sample_indices) > 1:
+                    mismatch_pos = (sample_pos + mismatch_offset) % len(sample_indices)
+                    if mismatch_pos == sample_pos:
+                        mismatch_pos = (sample_pos + 1) % len(sample_indices)
+                    sharer_mismatch_question_id = sample_indices[mismatch_pos]
+                    sharer_example = test_data[sharer_mismatch_question_id]
+                    sharer_prompt = self.format_example(
+                        sharer_example,
+                        use_cot=self.eval_config["use_cot"],
+                        subject=subject,
+                        tokenizer=tokenizer,
+                        use_template=self.eval_config["use_template"],
+                    )
+                    if self.dataset_name != "longbench":
+                        sharer_mismatch_true_answer = self.parse_answer(sharer_example)
                 
                 # Generate answer
                 if model_type in ["two_stage", "two_stage_rosetta"]:
@@ -1242,7 +1351,8 @@ class UnifiedEvaluator:
                         llm_tokenizer=llm_tokenizer,
                         answer_method=self.eval_config["answer_method"],
                         proportion=proportion,
-                        order_mode=order_mode
+                        order_mode=order_mode,
+                        sharer_prompt=sharer_prompt,
                     )
                     
                     if self.eval_config["answer_method"] == 'logits':
@@ -1385,6 +1495,12 @@ class UnifiedEvaluator:
                     'cot_output': cot_text,
                     'answer_latency_ms': float(latency_ms) if 'latency_ms' in locals() and latency_ms is not None else None
                 }
+                if sharer_prompt is not None:
+                    cot_log_entry.update({
+                        'sharer_mismatch_subject': subject,
+                        'sharer_mismatch_question_id': sharer_mismatch_question_id,
+                        'sharer_mismatch_true_answer': sharer_mismatch_true_answer,
+                    })
                 
                 # Add question and choices based on dataset format
                 if self.dataset_name == "mmmlu":
@@ -1740,6 +1856,7 @@ class UnifiedEvaluator:
                     'true_answer', 'pred', 'is_correct', 'answer_method',
                     'cot_pred', 'cot_input_length', 'cot_gen_length', 'cot_output',
                     'answer_latency_ms',
+                    'sharer_mismatch_subject', 'sharer_mismatch_question_id', 'sharer_mismatch_true_answer',
                     # Extraction diagnostics (mainly for MATH-500)
                     'extraction_method_used', 'ground_truth_normalized', 'extracted_normalized'
                 ]
