@@ -1,0 +1,67 @@
+{
+    "model": {
+        "base_model": "Qwen/Qwen3-0.6B",
+        "teacher_model": "Qwen/Qwen3-4B",
+        "is_do_alignment": false,
+        "alignment_strategy": "first",
+        "include_response": false,
+        "projector": {
+            "type": "ReceiverSeedSharedSpaceKVAlignmentResidualProjector",
+            "full_cache": true,
+            "params": {
+                "shared_dim": 672,
+                "adapter_dim": 32,
+                "intermediate_dim": 128,
+                "num_attention_heads": 4,
+                "dropout": 0.1,
+                "output_mode": "concat",
+                "use_target_residual": true,
+                "residual_scale": 1.0,
+                "residual_gate_init": 0.0,
+                "shared_mlp_layers": 3,
+                "shared_mlp_intermediate_dim": 2688
+            }
+        },
+        "mapping": "full_cache"
+    },
+    "training": {
+        "learning_rate": 0.0001,
+        "weight_decay": 0.01,
+        "num_epochs": 1,
+        "max_length": 1024,
+        "device": "cuda",
+        "scheduler_type": "linear",
+        "warmup_ratio": 0.1,
+        "max_grad_norm": 1.0,
+        "gradient_accumulation_steps": 32,
+        "per_device_train_batch_size": 4,
+        "num_processes": 2,
+        "freeze": [
+            "teacher",
+            "base"
+        ],
+        "seed": 42,
+        "loss_type": "hf_internal"
+    },
+    "output": {
+        "output_dir": "local/checkpoints/qwen3_0.6b_qwen3_4b_C2C_kv_align_receiverseed_sharedspace_residual_MMLU_15k_gate_0_sharedmlp3_hfloss_acc32_bs4_2gpu",
+        "save_steps": 500,
+        "eval_steps": 100,
+        "wandb_config": {
+            "project": "C2C",
+            "mode": "online",
+            "entity": "june6-hanyang-university",
+            "run_name": "qwen3_0.6b_qwen3_4b_C2C_kv_align_receiverseed_sharedspace_residual_MMLU_15k_gate_0_sharedmlp3_hfloss_acc32_bs4_2gpu"
+        }
+    },
+    "data": {
+        "type": "MMLUChatDataset",
+        "kwargs": {
+            "split": "auxiliary_train",
+            "max_word_count": 1024,
+            "num_samples": 15000,
+            "cache_dir": "local/hf_datasets_cache/mmlu_qwen3_0_6b_qwen3_4b_receiverseed_sharedspace_residual_gate_0_sharedmlp3_15k_hfloss_acc32_bs4_2gpu"
+        },
+        "train_ratio": 0.99
+    }
+}

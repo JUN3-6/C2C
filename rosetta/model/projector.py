@@ -2732,11 +2732,15 @@ class C2CReceiverSeedSharedSpaceKVAlignmentProjector(Projector):
         use_target_residual: bool = False,
         residual_scale: float = 1.0,
         residual_gate_init: float = -4.0,
+        shared_mlp_layers: int = 0,
+        shared_mlp_intermediate_dim: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         if adapter_dim % num_attention_heads != 0:
             raise ValueError("adapter_dim must be divisible by num_attention_heads")
+        if shared_mlp_layers < 0:
+            raise ValueError("shared_mlp_layers must be >= 0")
 
         self.source_dim = source_dim
         self.target_dim = target_dim
@@ -2750,6 +2754,8 @@ class C2CReceiverSeedSharedSpaceKVAlignmentProjector(Projector):
         self.use_target_residual = use_target_residual
         self.residual_scale = residual_scale
         self.residual_gate_init = residual_gate_init
+        self.shared_mlp_layers = shared_mlp_layers
+        self.shared_mlp_intermediate_dim = shared_mlp_intermediate_dim or max(intermediate_dim, shared_dim * 4)
         self.residual_gate_logit = nn.Parameter(
             torch.tensor(residual_gate_init, dtype=torch.float32),
             requires_grad=use_target_residual,
@@ -2791,6 +2797,24 @@ class C2CReceiverSeedSharedSpaceKVAlignmentProjector(Projector):
             dtype,
             output_mode=output_mode,
         )
+        if shared_mlp_layers > 0:
+            self.key_shared_mlp = RegularMLP(
+                hidden_dim=shared_dim,
+                intermediate_dim=self.shared_mlp_intermediate_dim,
+                num_layers=shared_mlp_layers,
+                dropout=dropout,
+                dtype=dtype,
+            )
+            self.value_shared_mlp = RegularMLP(
+                hidden_dim=shared_dim,
+                intermediate_dim=self.shared_mlp_intermediate_dim,
+                num_layers=shared_mlp_layers,
+                dropout=dropout,
+                dtype=dtype,
+            )
+        else:
+            self.key_shared_mlp = nn.Identity()
+            self.value_shared_mlp = nn.Identity()
         self.value_shared_to_target = _SharedToLocalAdapter(
             target_num_layers,
             target_flat_dim,
@@ -2839,6 +2863,8 @@ class C2CReceiverSeedSharedSpaceKVAlignmentProjector(Projector):
 
         shared_key = self.key_source_to_shared(source_key_local, target_key_local)
         shared_value = self.value_source_to_shared(source_value_local, target_value_local)
+        shared_key = self.key_shared_mlp(shared_key)
+        shared_value = self.value_shared_mlp(shared_value)
 
         target_key_local = self.key_shared_to_target(shared_key)
         target_value_local = self.value_shared_to_target(shared_value)
