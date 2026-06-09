@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 RECEIVER_MODEL="${RECEIVER_MODEL:-Qwen/Qwen3-0.6B}"
 
@@ -20,6 +21,7 @@ FIT_DEVICE="${FIT_DEVICE:-cuda:0}"
 CALIBRATION_PROMPTS="${CALIBRATION_PROMPTS:-script/calibration/prompts/mmlu_redux_disjoint_128_oneline.txt}"
 MAX_PROMPTS="${MAX_PROMPTS:-128}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
+CALIBRATION_BATCH_SIZE="${CALIBRATION_BATCH_SIZE:-8}"
 RIDGE="${RIDGE:-3.0}"
 BLEND_ALPHA="${BLEND_ALPHA:-0.52}"
 POSTPROCESS_MODE="${POSTPROCESS_MODE:-direct}"
@@ -68,6 +70,7 @@ fit_one() {
       --target-layers "$TARGET_LAYERS" \
       --max-prompts "$MAX_PROMPTS" \
       --max-length "$MAX_LENGTH" \
+      --calibration-batch-size "$CALIBRATION_BATCH_SIZE" \
       --ridge "$RIDGE" \
       --blend-alpha "$BLEND_ALPHA" \
       --postprocess-mode "$POSTPROCESS_MODE" \

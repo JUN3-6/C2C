@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-layers", default="all", help="'all' or comma-separated receiver layer indices.")
     parser.add_argument("--max-prompts", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--calibration-batch-size", type=int, default=8)
     parser.add_argument("--ridge", type=float, default=1e-3)
     parser.add_argument("--blend-alpha", type=float, default=1.0)
     parser.add_argument(
@@ -190,6 +191,27 @@ def iter_layer_pairs(mapping: Dict[int, List[int]], target_layers: Iterable[int]
 
 
 @torch.no_grad()
+def forward_cache_only(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    base_model = getattr(model, "model", None)
+    if base_model is not None:
+        output = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+    else:
+        output = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+            logits_to_keep=1,
+        )
+    return output.past_key_values
+
+
+@torch.no_grad()
 def run_models(receiver_model, source_model, tokenizer, prompts: List[str], device: str, max_length: int):
     encoded = tokenizer(
         prompts,
@@ -202,19 +224,84 @@ def run_models(receiver_model, source_model, tokenizer, prompts: List[str], devi
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
 
-    receiver_out = receiver_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-        return_dict=True,
-    )
-    source_out = source_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-        return_dict=True,
-    )
-    return input_ids, attention_mask, receiver_out.past_key_values, source_out.past_key_values
+    receiver_cache = forward_cache_only(receiver_model, input_ids, attention_mask)
+    source_cache = forward_cache_only(source_model, input_ids, attention_mask)
+    return input_ids, attention_mask, receiver_cache, source_cache
+
+
+@torch.no_grad()
+def collect_calibration_matrices(
+    receiver_model,
+    source_model,
+    tokenizer,
+    prompts: List[str],
+    device: str,
+    max_length: int,
+    batch_size: int,
+    pairs: List[Tuple[int, int]],
+) -> Dict[Tuple[int, int], Dict[str, object]]:
+    if batch_size <= 0:
+        raise ValueError("--calibration-batch-size must be positive")
+
+    chunks: Dict[Tuple[int, int], Dict[str, object]] = {
+        pair: {
+            "x_key": [],
+            "y_key": [],
+            "x_value": [],
+            "y_value": [],
+            "source_dim": None,
+            "target_dim": None,
+            "source_num_heads": None,
+            "target_num_heads": None,
+        }
+        for pair in pairs
+    }
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start : start + batch_size]
+        end = start + len(batch_prompts)
+        print(f"  - calibration batch {start + 1}-{end}/{len(prompts)}")
+        _, attention_mask, receiver_cache, source_cache = run_models(
+            receiver_model,
+            source_model,
+            tokenizer,
+            batch_prompts,
+            device,
+            max_length,
+        )
+        attention_mask_cpu = attention_mask.detach().cpu()
+
+        for target_layer, source_layer in pairs:
+            target_key, target_value = get_cache_layer(receiver_cache, target_layer)
+            source_key, source_value = get_cache_layer(source_cache, source_layer)
+            bucket = chunks[(target_layer, source_layer)]
+            if bucket["source_dim"] is None:
+                bucket["source_dim"] = int(source_key.shape[-1])
+                bucket["target_dim"] = int(target_key.shape[-1])
+                bucket["source_num_heads"] = int(source_key.shape[1])
+                bucket["target_num_heads"] = int(target_key.shape[1])
+            bucket["x_key"].append(flatten_valid(source_key, attention_mask_cpu))
+            bucket["y_key"].append(flatten_valid(target_key, attention_mask_cpu))
+            bucket["x_value"].append(flatten_valid(source_value, attention_mask_cpu))
+            bucket["y_value"].append(flatten_valid(target_value, attention_mask_cpu))
+
+        del attention_mask, attention_mask_cpu, receiver_cache, source_cache
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    result: Dict[Tuple[int, int], Dict[str, object]] = {}
+    for pair, tensors in chunks.items():
+        result[pair] = {
+            "x_key": torch.cat(tensors["x_key"], dim=0),
+            "y_key": torch.cat(tensors["y_key"], dim=0),
+            "x_value": torch.cat(tensors["x_value"], dim=0),
+            "y_value": torch.cat(tensors["y_value"], dim=0),
+            "source_dim": tensors["source_dim"],
+            "target_dim": tensors["target_dim"],
+            "source_num_heads": tensors["source_num_heads"],
+            "target_num_heads": tensors["target_num_heads"],
+        }
+    return result
 
 
 def save_checkpoint(output_dir: Path, projectors: List[ClosedFormKVAlignProjector], projector_config: Dict, metrics: Dict) -> None:
@@ -305,16 +392,20 @@ def main() -> None:
     if not pairs:
         raise ValueError("no layer pairs selected")
 
-    print(f"Running calibration forward on {len(prompts)} prompts, max_length={args.max_length}")
-    _, attention_mask, receiver_cache, source_cache = run_models(
+    print(
+        f"Running calibration forward on {len(prompts)} prompts, "
+        f"max_length={args.max_length}, batch_size={args.calibration_batch_size}"
+    )
+    calibration_matrices = collect_calibration_matrices(
         receiver_model,
         source_model,
         tokenizer,
         prompts,
         device,
         args.max_length,
+        args.calibration_batch_size,
+        pairs,
     )
-    attention_mask_cpu = attention_mask.detach().cpu()
 
     projectors: List[ClosedFormKVAlignProjector] = []
     projector_config = {0: {1: {}}}
@@ -334,22 +425,20 @@ def main() -> None:
     }
 
     for projector_idx, (target_layer, source_layer) in enumerate(pairs):
-        target_key, target_value = get_cache_layer(receiver_cache, target_layer)
-        source_key, source_value = get_cache_layer(source_cache, source_layer)
-
-        x_key = flatten_valid(source_key, attention_mask_cpu)
-        y_key = flatten_valid(target_key, attention_mask_cpu)
-        x_value = flatten_valid(source_value, attention_mask_cpu)
-        y_value = flatten_valid(target_value, attention_mask_cpu)
+        matrices = calibration_matrices[(target_layer, source_layer)]
+        x_key = matrices["x_key"]
+        y_key = matrices["y_key"]
+        x_value = matrices["x_value"]
+        y_value = matrices["y_value"]
 
         key_matrix, key_metrics = fit_ridge(x_key, y_key, args.ridge, use_bias=True)
         value_matrix, value_metrics = fit_ridge(x_value, y_value, args.ridge, use_bias=True)
 
         projector = ClosedFormKVAlignProjector(
-            source_dim=source_key.shape[-1],
-            target_dim=target_key.shape[-1],
-            source_num_heads=source_key.shape[1],
-            target_num_heads=target_key.shape[1],
+            source_dim=int(matrices["source_dim"]),
+            target_dim=int(matrices["target_dim"]),
+            source_num_heads=int(matrices["source_num_heads"]),
+            target_num_heads=int(matrices["target_num_heads"]),
             use_bias=True,
             blend_alpha=args.blend_alpha,
             postprocess_mode=args.postprocess_mode,
