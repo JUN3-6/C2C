@@ -956,36 +956,81 @@ class C2CProjector(Projector):
 
         B, Hs, N, Ds = source_key.shape
         _, Ht, _, Dt = target_key.shape
-
+        
+        # A. sharer/receiver cache를 load하는 구간
+        torch.cuda.nvtx.range_push("fuser.load_cache")
+        
         # Flatten heads
         source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
         source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
         target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
         target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
 
+        # A. load cache 구간 종료
+        torch.cuda.nvtx.range_pop()
+        
+        
+        # B. concat 구간
+        torch.cuda.nvtx.range_push("fuser.concat")
+        
         # 1) concat source and target features along channel
         key_cat = torch.cat([source_key_flat, target_key_flat], dim=-1)
         value_cat = torch.cat([source_value_flat, target_value_flat], dim=-1)
-
+        
+        # B. concat 구간 종료
+        torch.cuda.nvtx.range_pop()
+    
+    
+        # C. project to hidden dim 구간
+        torch.cuda.nvtx.range_push("fuser.concat_2_project")
+    
         # 2) project to hidden dim
         key_hidden = self.key_in(key_cat)
         value_hidden = self.value_in(value_cat)
 
+        # C. project to hidden dim 구간 종료
+        torch.cuda.nvtx.range_pop()
+    
+    
+        # D. Projection 구간
+        torch.cuda.nvtx.range_push("fuser.projection")
+        
         # 3) one-layer common embedding MLP to get intermediate representation (at hidden_dim)
         key_hidden = self.key_mlp1(key_hidden)
         value_hidden = self.value_mlp1(value_hidden)
+        
+        # D. Projection 구간 종료
+        torch.cuda.nvtx.range_pop()
 
+
+        # E. Projected feature path 구간
+        torch.cuda.nvtx.range_push("fuser.feature_fusion")
+        
         # 4b) intermediate representation -> projected feature path
         key_proj_hidden = self.key_proj_out(self.key_proj_mlp2(key_hidden)) # (B, N, Ht * Dt)
         value_proj_hidden = self.value_proj_out(self.value_proj_mlp2(value_hidden)) # (B, N, Ht * Dt)
         projected_key = key_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
         projected_value = value_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
+        
+        # E. Projected feature path 구간 종료
+        torch.cuda.nvtx.range_pop()
     
+    
+        # F. Scalar path 구간
+        torch.cuda.nvtx.range_push("fuser.dynamic_weight")
+        
         # 4a) intermediate representation -> scalar path
         key_scalar = self.key_scalar_head(self.key_scalar_mlp2(key_hidden))       # (B, N, Ht)
         value_scalar = self.value_scalar_head(self.value_scalar_mlp2(value_hidden)) # (B, N, Ht)
         key_scalar = key_scalar.permute(0, 2, 1).unsqueeze(-1)   # (B, Ht, N, 1)
         value_scalar = value_scalar.permute(0, 2, 1).unsqueeze(-1)  # (B, Ht, N, 1)
+
+        # F. Scalar path 구간 종료
+        torch.cuda.nvtx.range_pop()
+        
+        
+        # G. Gating 구간
+        torch.cuda.nvtx.range_push("fuser.gate_load")
 
         # Key/value gates: element-wise Gumbel noise with scalar logits (broadcast over channels)
         key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
@@ -1001,13 +1046,29 @@ class C2CProjector(Projector):
             key_gate = (key_gate_logit > 0).float()
             value_gate = (value_gate_logit > 0).float()
 
+        # G. Gating 구간 종료
+        torch.cuda.nvtx.range_pop()
+
+
+        # H. dynamic weight normalization 구간
+        torch.cuda.nvtx.range_push("fuser.dynamic_weight_norm")
+    
         # Normalize scalars (scalar_temperature=1.0)
         norm_key_scalar = torch.sigmoid(key_scalar)
         norm_value_scalar = torch.sigmoid(value_scalar)
 
+        # H. dynamic weight normalization 구간 종료
+        torch.cuda.nvtx.range_pop()
+
+        # I. write cache 구간
+        torch.cuda.nvtx.range_push("fuser.write_cache")
+        
         # Combine (preserve_target_weight=False, add_self=True)
         output_key = target_key + key_gate * norm_key_scalar * projected_key
         output_value = target_value + value_gate * norm_value_scalar * projected_value
+
+        # I. write cache 구간 종료
+        torch.cuda.nvtx.range_pop()
 
         # Expose capture attributes for downstream analysis scripts
         try:
@@ -1021,6 +1082,172 @@ class C2CProjector(Projector):
             # Best-effort capture; never break forward path
             pass
 
+        return output_key, output_value
+
+@register_model
+@capture_init_args
+class ClosedFormKVAlignProjector(Projector):
+    """
+    Training-free KV aligner fitted by ridge regression:
+        source KV -> target KV
+
+    The default mode predicts target-space KV directly. Optional postprocess
+    modes can keep receiver keys and add a norm-limited projected value residual.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        use_bias: bool = True,
+        blend_alpha: float = 1.0,
+        postprocess_mode: str = "direct",
+        norm_ratio: float = 1.0,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.use_bias = use_bias
+        self.blend_alpha = blend_alpha
+        self.postprocess_mode = postprocess_mode
+        self.norm_ratio = norm_ratio
+
+        in_dim = source_dim * source_num_heads
+        out_dim = target_dim * target_num_heads
+        matrix_in_dim = in_dim + (1 if use_bias else 0)
+
+        self.register_buffer("key_matrix", torch.zeros(matrix_in_dim, out_dim, dtype=dtype))
+        self.register_buffer("value_matrix", torch.zeros(matrix_in_dim, out_dim, dtype=dtype))
+
+    def is_gate_open(self) -> bool:
+        return True
+
+    def set_alignment(self, key_matrix: Tensor, value_matrix: Tensor) -> None:
+        if key_matrix.shape != self.key_matrix.shape:
+            raise ValueError(f"key_matrix shape mismatch: {key_matrix.shape} vs {self.key_matrix.shape}")
+        if value_matrix.shape != self.value_matrix.shape:
+            raise ValueError(f"value_matrix shape mismatch: {value_matrix.shape} vs {self.value_matrix.shape}")
+        self.key_matrix.copy_(key_matrix.to(device=self.key_matrix.device, dtype=self.key_matrix.dtype))
+        self.value_matrix.copy_(value_matrix.to(device=self.value_matrix.device, dtype=self.value_matrix.dtype))
+
+    def _project(self, tensor: Tensor, matrix: Tensor) -> Tensor:
+        batch, heads, seq_len, head_dim = tensor.shape
+        in_dim = heads * head_dim
+        expected_in_dim = self.source_num_heads * self.source_dim
+        if in_dim != expected_in_dim:
+            raise ValueError(f"source KV dim mismatch: got {in_dim}, expected {expected_in_dim}")
+
+        flat = tensor.transpose(1, 2).contiguous().view(batch, seq_len, in_dim)
+        flat = flat.to(matrix.dtype)
+        if self.use_bias:
+            ones = torch.ones(batch, seq_len, 1, device=flat.device, dtype=flat.dtype)
+            flat = torch.cat([flat, ones], dim=-1)
+
+        projected = torch.matmul(flat, matrix)
+        projected = projected.view(batch, seq_len, self.target_num_heads, self.target_dim)
+        projected = projected.transpose(1, 2).contiguous()
+        return projected.to(tensor.dtype)
+
+    def _norm_to_reference(self, tensor: Tensor, reference: Tensor) -> Tensor:
+        tensor_f = tensor.float()
+        reference_f = reference.float()
+        norm_shape = (tensor.shape[0],) + (1,) * (tensor.dim() - 1)
+        tensor_norm = tensor_f.flatten(1).norm(dim=1).view(norm_shape).clamp_min(1e-6)
+        reference_norm = reference_f.flatten(1).norm(dim=1).view(norm_shape).clamp_min(1e-6)
+        scaled = tensor_f * (reference_norm * self.norm_ratio / tensor_norm)
+        return scaled.to(dtype=reference.dtype)
+
+    def _token_norm_to_reference(self, tensor: Tensor, reference: Tensor) -> Tensor:
+        tensor_f = tensor.float()
+        reference_f = reference.float()
+        tensor_norm = tensor_f.transpose(1, 2).flatten(2).norm(dim=-1).clamp_min(1e-6)
+        reference_norm = reference_f.transpose(1, 2).flatten(2).norm(dim=-1).clamp_min(1e-6)
+        scale = (reference_norm * self.norm_ratio / tensor_norm).unsqueeze(1).unsqueeze(-1)
+        return (tensor_f * scale).to(dtype=reference.dtype)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        del position_ids, max_pos
+        source_key, source_value = source_kv
+        projected_key = self._project(source_key, self.key_matrix)
+        projected_value = self._project(source_value, self.value_matrix)
+        target_key, target_value = target_kv
+
+        if self.postprocess_mode == "value_norm_residual":
+            normed_value = self._norm_to_reference(projected_value, target_value)
+            return target_key, target_value + self.blend_alpha * normed_value
+
+        if self.postprocess_mode == "kv_norm_residual":
+            normed_key = self._norm_to_reference(projected_key, target_key)
+            normed_value = self._norm_to_reference(projected_value, target_value)
+            return (
+                target_key + self.blend_alpha * normed_key,
+                target_value + self.blend_alpha * normed_value,
+            )
+
+        if self.postprocess_mode == "value_delta_residual":
+            delta_value = projected_value - target_value
+            return target_key, target_value + self.blend_alpha * delta_value
+
+        if self.postprocess_mode == "kv_delta_residual":
+            delta_key = projected_key - target_key
+            delta_value = projected_value - target_value
+            return (
+                target_key + self.blend_alpha * delta_key,
+                target_value + self.blend_alpha * delta_value,
+            )
+
+        if self.postprocess_mode == "value_norm_delta_residual":
+            delta_value = projected_value - target_value
+            normed_value = self._norm_to_reference(delta_value, target_value)
+            return target_key, target_value + self.blend_alpha * normed_value
+
+        if self.postprocess_mode == "key_direct":
+            alpha = self.blend_alpha
+            return target_key + alpha * (projected_key - target_key), target_value
+
+        if self.postprocess_mode == "value_direct":
+            alpha = self.blend_alpha
+            return target_key, target_value + alpha * (projected_value - target_value)
+
+        if self.postprocess_mode == "kv_token_norm_direct":
+            alpha = self.blend_alpha
+            normed_key = self._token_norm_to_reference(projected_key, target_key)
+            normed_value = self._token_norm_to_reference(projected_value, target_value)
+            return (
+                target_key + alpha * (normed_key - target_key),
+                target_value + alpha * (normed_value - target_value),
+            )
+
+        if self.postprocess_mode == "kv_norm_delta_residual":
+            delta_key = projected_key - target_key
+            delta_value = projected_value - target_value
+            normed_key = self._norm_to_reference(delta_key, target_key)
+            normed_value = self._norm_to_reference(delta_value, target_value)
+            return (
+                target_key + self.blend_alpha * normed_key,
+                target_value + self.blend_alpha * normed_value,
+            )
+
+        if self.postprocess_mode != "direct":
+            raise ValueError(f"Unsupported postprocess_mode: {self.postprocess_mode}")
+
+        if self.blend_alpha == 1.0:
+            return projected_key, projected_value
+
+        alpha = self.blend_alpha
+        output_key = target_key + alpha * (projected_key - target_key)
+        output_value = target_value + alpha * (projected_value - target_value)
         return output_key, output_value
 
 def save_projector(obj: Projector, file_path: str) -> None:

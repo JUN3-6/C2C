@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+
+RECEIVER_MODEL="${RECEIVER_MODEL:-Qwen/Qwen3-0.6B}"
+
+QWEN25_05B_MODEL="${QWEN25_05B_MODEL:-Qwen/Qwen2.5-0.5B}"
+QWEN3_4B_MODEL="${QWEN3_4B_MODEL:-Qwen/Qwen3-4B}"
+# Override these with local paths if needed.
+QWEN3_7B_MODEL="${QWEN3_7B_MODEL:-Qwen/Qwen3-8B}"
+QWEN25_05B_LABEL="${QWEN25_05B_LABEL:-qwen2p5_0p5b}"
+QWEN3_4B_LABEL="${QWEN3_4B_LABEL:-qwen3_4b}"
+QWEN3_7B_LABEL="${QWEN3_7B_LABEL:-qwen3_8b}"
+
+FIT_DEVICE="${FIT_DEVICE:-cuda:0}"
+EVAL_GPU_IDS="${EVAL_GPU_IDS:-0,2}"
+CALIBRATION_PROMPTS="${CALIBRATION_PROMPTS:-script/calibration/prompts/mmlu_redux_disjoint_128_oneline.txt}"
+MAX_PROMPTS="${MAX_PROMPTS:-128}"
+MAX_LENGTH="${MAX_LENGTH:-1024}"
+RIDGE="${RIDGE:-3.0}"
+BLEND_ALPHA="${BLEND_ALPHA:-0.52}"
+POSTPROCESS_MODE="${POSTPROCESS_MODE:-direct}"
+MAPPING="${MAPPING:-k_nearest}"
+K="${K:-1}"
+TARGET_LAYERS="${TARGET_LAYERS:-all}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
+FORCE_REFIT="${FORCE_REFIT:-0}"
+MISMATCH_OFFSET="${MISMATCH_OFFSET:-1}"
+
+LOG_DIR="${LOG_DIR:-local/logs/closed_form_qwen_receiver_sharer_sweep_gpu02}"
+mkdir -p "$LOG_DIR"
+
+run_one() {
+  local label="$1"
+  local source_model="$2"
+  local checkpoint_dir="local/checkpoints/${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}/final"
+  local fit_log="${LOG_DIR}/${label}_fit_$(date +%Y%m%d_%H%M%S).log"
+
+  echo "============================================================"
+  echo "Sharer:      ${label}"
+  echo "Receiver:    ${RECEIVER_MODEL}"
+  echo "Source:      ${source_model}"
+  echo "Checkpoint:  ${checkpoint_dir}"
+  echo "Fit device:  ${FIT_DEVICE}"
+  echo "Eval GPUs:   ${EVAL_GPU_IDS}"
+  echo "============================================================"
+
+  if [[ "${FORCE_REFIT}" == "1" || ! -f "${checkpoint_dir}/projector_config.json" ]]; then
+    mkdir -p "$(dirname "$checkpoint_dir")"
+    python script/calibration/fit_closed_form_kv_align.py \
+      --receiver-model "$RECEIVER_MODEL" \
+      --source-model "$source_model" \
+      --output-dir "$checkpoint_dir" \
+      --device "$FIT_DEVICE" \
+      --dtype bfloat16 \
+      --mapping "$MAPPING" \
+      --k "$K" \
+      --target-layers "$TARGET_LAYERS" \
+      --max-prompts "$MAX_PROMPTS" \
+      --max-length "$MAX_LENGTH" \
+      --ridge "$RIDGE" \
+      --blend-alpha "$BLEND_ALPHA" \
+      --postprocess-mode "$POSTPROCESS_MODE" \
+      --calibration-text-file "$CALIBRATION_PROMPTS" \
+      2>&1 | tee "$fit_log"
+  else
+    echo "Skip fitting; existing checkpoint found at ${checkpoint_dir}"
+  fi
+
+  BASE_MODEL="$RECEIVER_MODEL" \
+  TEACHER_MODEL="$source_model" \
+  GPU_IDS="$EVAL_GPU_IDS" \
+  MAX_NEW_TOKENS="$MAX_NEW_TOKENS" \
+  INCLUDE_RESPONSE=false \
+  MULTI_SOURCE_FUSION_MODE=parallel \
+  OUTPUT_DIR="local/final_results/${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}_mmlu_redux" \
+  LOG_DIR="$LOG_DIR" \
+    bash bash/eval/mmlu_redux_rosetta_equal.sh \
+      "$checkpoint_dir" \
+      "${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}"
+
+  BASE_MODEL="$RECEIVER_MODEL" \
+  TEACHER_MODEL="$source_model" \
+  GPU_IDS="$EVAL_GPU_IDS" \
+  MAX_NEW_TOKENS="$MAX_NEW_TOKENS" \
+  INCLUDE_RESPONSE=false \
+  MULTI_SOURCE_FUSION_MODE=parallel \
+  MISMATCH_OFFSET="$MISMATCH_OFFSET" \
+  OUTPUT_DIR="local/final_results/${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}_mmlu_redux_mismatch_offset${MISMATCH_OFFSET}" \
+  LOG_DIR="$LOG_DIR" \
+    bash bash/eval/mmlu_redux_source_mismatch.sh \
+      "$checkpoint_dir" \
+      "${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}_mismatch_offset${MISMATCH_OFFSET}"
+}
+
+run_one "qwen3_receiver__${QWEN25_05B_LABEL}" "$QWEN25_05B_MODEL"
+run_one "qwen3_receiver__${QWEN3_4B_LABEL}" "$QWEN3_4B_MODEL"
+run_one "qwen3_receiver__${QWEN3_7B_LABEL}" "$QWEN3_7B_MODEL"

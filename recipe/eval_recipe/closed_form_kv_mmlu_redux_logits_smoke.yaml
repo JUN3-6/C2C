@@ -1,0 +1,27 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen3-4B
+    is_do_alignment: false
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/qwen3_4b_to_0p6b_closed_form_kv_disjoint128_ridge3_direct_a0p47/final
+    multi_source_fusion_mode: "parallel"
+  generation_config:
+    do_sample: false
+    max_new_tokens: 6
+
+output:
+  output_dir: local/eval_results/qwen3_4b_to_0p6b_closed_form_kv_disjoint128_ridge3_direct_a0p47_mmlu_redux_logits_smoke
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: logits
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  limit: 1
+  subjects: ["abstract_algebra"]
+  response_text: "The correct answer is"
+  math_grading_method: "comprehensive"
