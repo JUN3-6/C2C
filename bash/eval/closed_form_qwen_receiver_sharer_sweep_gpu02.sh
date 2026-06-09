@@ -81,35 +81,15 @@ fit_one() {
   fi
 }
 
-fit_all() {
+fit_gpu_for() {
+  local idx="$1"
   local fit_gpus_raw="${FIT_GPU_IDS// /}"
   IFS=',' read -r -a fit_gpus <<< "$fit_gpus_raw"
   if (( ${#fit_gpus[@]} == 0 )) || [[ -z "${fit_gpus[0]}" ]]; then
     echo "FIT_GPU_IDS must contain at least one GPU id" >&2
     exit 1
   fi
-
-  local -a pids=()
-  local active=0
-  local idx
-  for idx in "${!LABELS[@]}"; do
-    local fit_gpu="${fit_gpus[$((idx % ${#fit_gpus[@]}))]}"
-    fit_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}" "$fit_gpu" &
-    pids+=("$!")
-    active=$((active + 1))
-
-    if (( active == ${#fit_gpus[@]} )); then
-      for pid in "${pids[@]}"; do
-        wait "$pid"
-      done
-      pids=()
-      active=0
-    fi
-  done
-
-  for pid in "${pids[@]}"; do
-    wait "$pid"
-  done
+  echo "${fit_gpus[$((idx % ${#fit_gpus[@]}))]}"
 }
 
 eval_one() {
@@ -163,10 +143,9 @@ SOURCE_MODELS=(
   "$SHARER_LARGE_MODEL"
 )
 
-echo "Phase 1/2: fit closed-form KV projectors for all model pairs"
-fit_all
-
-echo "Phase 2/2: run clean and mismatch MMLU-Redux benchmarks for all model pairs"
+echo "Run each model pair sequentially: calibration -> clean/mismatch benchmarks"
 for idx in "${!LABELS[@]}"; do
+  fit_gpu="$(fit_gpu_for "$idx")"
+  fit_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}" "$fit_gpu"
   eval_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}"
 done
