@@ -33,19 +33,24 @@ MISMATCH_OFFSET="${MISMATCH_OFFSET:-1}"
 LOG_DIR="${LOG_DIR:-local/logs/closed_form_qwen_receiver_sharer_sweep_gpu02}"
 mkdir -p "$LOG_DIR"
 
-run_one() {
+checkpoint_dir_for() {
+  local label="$1"
+  echo "local/checkpoints/${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}/final"
+}
+
+fit_one() {
   local label="$1"
   local source_model="$2"
-  local checkpoint_dir="local/checkpoints/${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}/final"
+  local checkpoint_dir
+  checkpoint_dir="$(checkpoint_dir_for "$label")"
   local fit_log="${LOG_DIR}/${label}_fit_$(date +%Y%m%d_%H%M%S).log"
 
   echo "============================================================"
-  echo "Sharer:      ${label}"
+  echo "[Calibration] ${label}"
   echo "Receiver:    ${RECEIVER_MODEL}"
   echo "Source:      ${source_model}"
   echo "Checkpoint:  ${checkpoint_dir}"
   echo "Fit device:  ${FIT_DEVICE}"
-  echo "Eval GPUs:   ${EVAL_GPU_IDS}"
   echo "============================================================"
 
   if [[ "${FORCE_REFIT}" == "1" || ! -f "${checkpoint_dir}/projector_config.json" ]]; then
@@ -69,6 +74,21 @@ run_one() {
   else
     echo "Skip fitting; existing checkpoint found at ${checkpoint_dir}"
   fi
+}
+
+eval_one() {
+  local label="$1"
+  local source_model="$2"
+  local checkpoint_dir
+  checkpoint_dir="$(checkpoint_dir_for "$label")"
+
+  echo "============================================================"
+  echo "[Benchmark] ${label}"
+  echo "Receiver:    ${RECEIVER_MODEL}"
+  echo "Source:      ${source_model}"
+  echo "Checkpoint:  ${checkpoint_dir}"
+  echo "Eval GPUs:   ${EVAL_GPU_IDS}"
+  echo "============================================================"
 
   BASE_MODEL="$RECEIVER_MODEL" \
   TEACHER_MODEL="$source_model" \
@@ -96,6 +116,23 @@ run_one() {
       "${label}_closed_form_kv_${MAPPING}_ridge${RIDGE}_a${BLEND_ALPHA}_mismatch_offset${MISMATCH_OFFSET}"
 }
 
-run_one "qwen3_receiver__${QWEN25_05B_LABEL}" "$QWEN25_05B_MODEL"
-run_one "qwen3_receiver__${QWEN3_4B_LABEL}" "$QWEN3_4B_MODEL"
-run_one "qwen3_receiver__${QWEN3_7B_LABEL}" "$QWEN3_7B_MODEL"
+LABELS=(
+  "qwen3_receiver__${QWEN25_05B_LABEL}"
+  "qwen3_receiver__${QWEN3_4B_LABEL}"
+  "qwen3_receiver__${QWEN3_7B_LABEL}"
+)
+SOURCE_MODELS=(
+  "$QWEN25_05B_MODEL"
+  "$QWEN3_4B_MODEL"
+  "$QWEN3_7B_MODEL"
+)
+
+echo "Phase 1/2: fit closed-form KV projectors for all model pairs"
+for idx in "${!LABELS[@]}"; do
+  fit_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}"
+done
+
+echo "Phase 2/2: run clean and mismatch MMLU-Redux benchmarks for all model pairs"
+for idx in "${!LABELS[@]}"; do
+  eval_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}"
+done
