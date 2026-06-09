@@ -7,13 +7,10 @@ export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 
 RECEIVER_MODEL="${RECEIVER_MODEL:-Qwen/Qwen3-0.6B}"
 
-QWEN25_05B_MODEL="${QWEN25_05B_MODEL:-Qwen/Qwen2.5-0.5B}"
-QWEN3_4B_MODEL="${QWEN3_4B_MODEL:-Qwen/Qwen3-4B}"
-# Override these with local paths if needed.
-QWEN3_7B_MODEL="${QWEN3_7B_MODEL:-Qwen/Qwen3-8B}"
-QWEN25_05B_LABEL="${QWEN25_05B_LABEL:-qwen2p5_0p5b}"
-QWEN3_4B_LABEL="${QWEN3_4B_LABEL:-qwen3_4b}"
-QWEN3_7B_LABEL="${QWEN3_7B_LABEL:-qwen3_8b}"
+SHARER_SMALL_MODEL="${SHARER_SMALL_MODEL:-Qwen/Qwen3-0.6B}"
+SHARER_LARGE_MODEL="${SHARER_LARGE_MODEL:-Qwen/Qwen3-8B}"
+SHARER_SMALL_LABEL="${SHARER_SMALL_LABEL:-qwen3_0p6b}"
+SHARER_LARGE_LABEL="${SHARER_LARGE_LABEL:-qwen3_8b}"
 
 FIT_DEVICE="${FIT_DEVICE:-cuda:0}"
 EVAL_GPU_IDS="${EVAL_GPU_IDS:-0,2}"
@@ -117,14 +114,12 @@ eval_one() {
 }
 
 LABELS=(
-  "qwen3_receiver__${QWEN25_05B_LABEL}"
-  "qwen3_receiver__${QWEN3_4B_LABEL}"
-  "qwen3_receiver__${QWEN3_7B_LABEL}"
+  "qwen3_receiver__${SHARER_SMALL_LABEL}"
+  "qwen3_receiver__${SHARER_LARGE_LABEL}"
 )
 SOURCE_MODELS=(
-  "$QWEN25_05B_MODEL"
-  "$QWEN3_4B_MODEL"
-  "$QWEN3_7B_MODEL"
+  "$SHARER_SMALL_MODEL"
+  "$SHARER_LARGE_MODEL"
 )
 
 echo "Phase 1/2: fit closed-form KV projectors for all model pairs"
