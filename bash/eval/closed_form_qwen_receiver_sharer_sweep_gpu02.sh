@@ -14,8 +14,9 @@ SHARER_SMALL_LABEL="${SHARER_SMALL_LABEL:-qwen2p5_0p5b}"
 SHARER_MID_LABEL="${SHARER_MID_LABEL:-qwen3_4b}"
 SHARER_LARGE_LABEL="${SHARER_LARGE_LABEL:-qwen3_8b}"
 
-FIT_DEVICE="${FIT_DEVICE:-cuda:0}"
 EVAL_GPU_IDS="${EVAL_GPU_IDS:-0,2}"
+FIT_GPU_IDS="${FIT_GPU_IDS:-$EVAL_GPU_IDS}"
+FIT_DEVICE="${FIT_DEVICE:-cuda:0}"
 CALIBRATION_PROMPTS="${CALIBRATION_PROMPTS:-script/calibration/prompts/mmlu_redux_disjoint_128_oneline.txt}"
 MAX_PROMPTS="${MAX_PROMPTS:-128}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
@@ -40,6 +41,7 @@ checkpoint_dir_for() {
 fit_one() {
   local label="$1"
   local source_model="$2"
+  local fit_gpu="$3"
   local checkpoint_dir
   checkpoint_dir="$(checkpoint_dir_for "$label")"
   local fit_log="${LOG_DIR}/${label}_fit_$(date +%Y%m%d_%H%M%S).log"
@@ -49,12 +51,13 @@ fit_one() {
   echo "Receiver:    ${RECEIVER_MODEL}"
   echo "Source:      ${source_model}"
   echo "Checkpoint:  ${checkpoint_dir}"
-  echo "Fit device:  ${FIT_DEVICE}"
+  echo "Fit GPU:     ${fit_gpu}"
+  echo "Fit device:  ${FIT_DEVICE} inside CUDA_VISIBLE_DEVICES=${fit_gpu}"
   echo "============================================================"
 
   if [[ "${FORCE_REFIT}" == "1" || ! -f "${checkpoint_dir}/projector_config.json" ]]; then
     mkdir -p "$(dirname "$checkpoint_dir")"
-    python script/calibration/fit_closed_form_kv_align.py \
+    CUDA_VISIBLE_DEVICES="$fit_gpu" python script/calibration/fit_closed_form_kv_align.py \
       --receiver-model "$RECEIVER_MODEL" \
       --source-model "$source_model" \
       --output-dir "$checkpoint_dir" \
@@ -73,6 +76,37 @@ fit_one() {
   else
     echo "Skip fitting; existing checkpoint found at ${checkpoint_dir}"
   fi
+}
+
+fit_all() {
+  local fit_gpus_raw="${FIT_GPU_IDS// /}"
+  IFS=',' read -r -a fit_gpus <<< "$fit_gpus_raw"
+  if (( ${#fit_gpus[@]} == 0 )) || [[ -z "${fit_gpus[0]}" ]]; then
+    echo "FIT_GPU_IDS must contain at least one GPU id" >&2
+    exit 1
+  fi
+
+  local -a pids=()
+  local active=0
+  local idx
+  for idx in "${!LABELS[@]}"; do
+    local fit_gpu="${fit_gpus[$((idx % ${#fit_gpus[@]}))]}"
+    fit_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}" "$fit_gpu" &
+    pids+=("$!")
+    active=$((active + 1))
+
+    if (( active == ${#fit_gpus[@]} )); then
+      for pid in "${pids[@]}"; do
+        wait "$pid"
+      done
+      pids=()
+      active=0
+    fi
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
 }
 
 eval_one() {
@@ -127,9 +161,7 @@ SOURCE_MODELS=(
 )
 
 echo "Phase 1/2: fit closed-form KV projectors for all model pairs"
-for idx in "${!LABELS[@]}"; do
-  fit_one "${LABELS[$idx]}" "${SOURCE_MODELS[$idx]}"
-done
+fit_all
 
 echo "Phase 2/2: run clean and mismatch MMLU-Redux benchmarks for all model pairs"
 for idx in "${!LABELS[@]}"; do
