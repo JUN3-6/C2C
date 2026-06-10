@@ -33,6 +33,7 @@ from rosetta.train.dataset_adapters import ChatDataset, AlignedChatDataset, Rose
 from rosetta.model.aligner import TokenAligner, AlignmentStrategy
 from rosetta.train.model_utils import k_nearest_sources, last_aligned_sources
 from rosetta.model.projector import AllInOneProjector
+from rosetta.model.value_only import apply_projector_value_only
 from rosetta.utils.evaluate import set_default_chat_template
 
 # PEFT imports for LoRA (baseline mode)
@@ -680,6 +681,13 @@ def main():
     
     model, main_tokenizer, aligner, llm_tokenizer = setup_models(model_config, training_mode, device, torch.bfloat16)
     model = model.to(device)
+    if training_mode == "rosetta" and (
+        model_config.get("projector_value_only", False)
+        or training_config.get("projector_value_only", False)
+    ):
+        if is_main_process:
+            print("Applying value-only projector patch: receiver keys are preserved")
+        apply_projector_value_only(model)
 
     # Apply freezing/training configuration based on mode
     if training_mode == "baseline":
