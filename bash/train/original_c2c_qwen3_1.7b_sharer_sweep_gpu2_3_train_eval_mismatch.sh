@@ -8,11 +8,14 @@ MASTER_PORT_BASE=${MASTER_PORT_BASE:-29920}
 LOG_DIR=${LOG_DIR:-local/logs/original_c2c_qwen3_1.7b_sharer_sweep_gpu2_3_train_eval_mismatch}
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 MAIN_LOG=${MAIN_LOG:-${LOG_DIR}/main_${TIMESTAMP}.log}
+TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-local/tmp/original_c2c_qwen3_1.7b_sharer_sweep_gpu2_3_train_eval_mismatch/${TIMESTAMP}}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-256}
 SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL:-1}
 SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY:-0}
 DRY_RUN=${DRY_RUN:-0}
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${TMP_CONFIG_DIR}"
 exec > >(tee -a "${MAIN_LOG}") 2>&1
 
 NAMES=(
@@ -58,6 +61,89 @@ with open(sys.argv[1]) as f:
 PY
 }
 
+materialize_configs() {
+  local idx="$1"
+  local gpu="$2"
+  local train_config="$3"
+  local eval_config="$4"
+  local mismatch_config="$5"
+  local out_dir="${TMP_CONFIG_DIR}/job${idx}_gpu${gpu}"
+  mkdir -p "${out_dir}"
+
+  python - \
+    "${train_config}" \
+    "${eval_config}" \
+    "${mismatch_config}" \
+    "${out_dir}" \
+    "${gpu}" \
+    "${PER_DEVICE_BATCH_SIZE}" \
+    "${GRAD_ACCUM_STEPS}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+train_path, eval_path, mismatch_path, out_dir, gpu, batch_size, grad_accum = sys.argv[1:8]
+batch_size_i = int(batch_size)
+grad_accum_i = int(grad_accum)
+out = Path(out_dir)
+
+
+def apply_suffix(text: str) -> str:
+    text = re.sub(r"_bs\d+_acc\d+_", f"_bs{batch_size_i}_acc{grad_accum_i}_", text)
+    text = re.sub(r"_gpu\d+_1gpu", f"_gpu{gpu}_1gpu", text)
+    return text
+
+
+with open(train_path) as f:
+    train = json.load(f)
+
+train["training"]["per_device_train_batch_size"] = batch_size_i
+train["training"]["gradient_accumulation_steps"] = grad_accum_i
+train["training"]["num_processes"] = 1
+
+old_train_output = train["output"]["output_dir"]
+new_train_output = apply_suffix(old_train_output)
+train["output"]["output_dir"] = new_train_output
+
+wandb_config = train.get("output", {}).get("wandb_config", {})
+if "run_name" in wandb_config:
+    wandb_config["run_name"] = apply_suffix(wandb_config["run_name"])
+
+data_kwargs = train.get("data", {}).get("kwargs", {})
+if "cache_dir" in data_kwargs:
+    data_kwargs["cache_dir"] = apply_suffix(data_kwargs["cache_dir"])
+
+
+def rewrite_eval(path: str, suffix: str):
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    cfg["model"]["rosetta_config"]["checkpoints_dir"] = f"{new_train_output}/final"
+    cfg["eval"]["gpu_ids"] = [0]
+    cfg["output"]["output_dir"] = apply_suffix(cfg["output"]["output_dir"])
+    if "dataset_cache_dir" in cfg["eval"]:
+        cfg["eval"]["dataset_cache_dir"] = apply_suffix(cfg["eval"]["dataset_cache_dir"])
+    dest = out / suffix
+    with open(dest, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    return dest
+
+
+train_dest = out / "train.json"
+with open(train_dest, "w") as f:
+    json.dump(train, f, indent=4)
+
+eval_dest = rewrite_eval(eval_path, "eval.yaml")
+mismatch_dest = rewrite_eval(mismatch_path, "mismatch.yaml")
+
+print(train_dest)
+print(eval_dest)
+print(mismatch_dest)
+PY
+}
+
 run_or_print() {
   if [[ "${DRY_RUN}" == "1" ]]; then
     printf '[dry-run]'
@@ -77,9 +163,15 @@ run_one() {
   local mismatch_config="${MISMATCH_CONFIGS[$idx]}"
   local master_port=$((MASTER_PORT_BASE + idx))
   local job_log="${LOG_DIR}/${name}_${TIMESTAMP}.log"
+  local materialized
   local checkpoint_dir
   local eval_output_dir
   local mismatch_output_dir
+
+  mapfile -t materialized < <(materialize_configs "${idx}" "${gpu}" "${train_config}" "${eval_config}" "${mismatch_config}")
+  train_config="${materialized[0]}"
+  eval_config="${materialized[1]}"
+  mismatch_config="${materialized[2]}"
 
   checkpoint_dir="$(json_get_output_dir "${train_config}")"
   eval_output_dir="$(yaml_get_output_dir "${eval_config}")"
@@ -95,6 +187,8 @@ run_one() {
     echo "Job: ${name}"
     echo "Physical GPU: ${gpu}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
+    echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "Train config: ${train_config}"
     echo "Eval config: ${eval_config}"
     echo "Mismatch config: ${mismatch_config}"
@@ -130,6 +224,9 @@ run_one() {
 
 echo "Logging to ${MAIN_LOG}"
 echo "Start time: $(date)"
+echo "TMP_CONFIG_DIR=${TMP_CONFIG_DIR}"
+echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
+echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
 echo "SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL}"
 echo "SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY}"
 echo "DRY_RUN=${DRY_RUN}"
