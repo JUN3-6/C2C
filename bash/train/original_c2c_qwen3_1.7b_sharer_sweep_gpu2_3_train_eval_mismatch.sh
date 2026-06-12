@@ -9,8 +9,10 @@ LOG_DIR=${LOG_DIR:-local/logs/original_c2c_qwen3_1.7b_sharer_sweep_gpu2_3_train_
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 MAIN_LOG=${MAIN_LOG:-${LOG_DIR}/main_${TIMESTAMP}.log}
 TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-local/tmp/original_c2c_qwen3_1.7b_sharer_sweep_gpu2_3_train_eval_mismatch/${TIMESTAMP}}
-PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
-GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-256}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-64}
+EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-16}
+EVAL_ONLY=${EVAL_ONLY:-0}
 SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL:-1}
 SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY:-0}
 DRY_RUN=${DRY_RUN:-0}
@@ -77,7 +79,8 @@ materialize_configs() {
     "${out_dir}" \
     "${gpu}" \
     "${PER_DEVICE_BATCH_SIZE}" \
-    "${GRAD_ACCUM_STEPS}" <<'PY'
+    "${GRAD_ACCUM_STEPS}" \
+    "${EVAL_MAX_NEW_TOKENS}" <<'PY'
 import json
 import re
 import sys
@@ -85,15 +88,23 @@ from pathlib import Path
 
 import yaml
 
-train_path, eval_path, mismatch_path, out_dir, gpu, batch_size, grad_accum = sys.argv[1:8]
+train_path, eval_path, mismatch_path, out_dir, gpu, batch_size, grad_accum, eval_max_new_tokens = sys.argv[1:9]
 batch_size_i = int(batch_size)
 grad_accum_i = int(grad_accum)
+eval_max_new_tokens_i = int(eval_max_new_tokens)
 out = Path(out_dir)
 
 
 def apply_suffix(text: str) -> str:
     text = re.sub(r"_bs\d+_acc\d+_", f"_bs{batch_size_i}_acc{grad_accum_i}_", text)
     text = re.sub(r"_gpu\d+_1gpu", f"_gpu{gpu}_1gpu", text)
+    return text
+
+
+def apply_eval_suffix(text: str) -> str:
+    text = apply_suffix(text)
+    if f"_gen{eval_max_new_tokens_i}" not in text:
+        text = f"{text}_gen{eval_max_new_tokens_i}"
     return text
 
 
@@ -121,8 +132,12 @@ def rewrite_eval(path: str, suffix: str):
     with open(path) as f:
         cfg = yaml.safe_load(f)
     cfg["model"]["rosetta_config"]["checkpoints_dir"] = f"{new_train_output}/final"
+    cfg.setdefault("model", {}).setdefault("generation_config", {})
+    cfg["model"]["generation_config"]["do_sample"] = False
+    cfg["model"]["generation_config"]["max_new_tokens"] = eval_max_new_tokens_i
     cfg["eval"]["gpu_ids"] = [0]
-    cfg["output"]["output_dir"] = apply_suffix(cfg["output"]["output_dir"])
+    cfg["eval"]["max_new_tokens"] = eval_max_new_tokens_i
+    cfg["output"]["output_dir"] = apply_eval_suffix(cfg["output"]["output_dir"])
     if "dataset_cache_dir" in cfg["eval"]:
         cfg["eval"]["dataset_cache_dir"] = apply_suffix(cfg["eval"]["dataset_cache_dir"])
     dest = out / suffix
@@ -189,6 +204,8 @@ run_one() {
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
     echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
+    echo "EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS}"
+    echo "EVAL_ONLY=${EVAL_ONLY}"
     echo "Train config: ${train_config}"
     echo "Eval config: ${eval_config}"
     echo "Mismatch config: ${mismatch_config}"
@@ -197,7 +214,13 @@ run_one() {
     echo "Mismatch output dir: ${mismatch_output_dir}"
     echo "Start time: $(date)"
 
-    if [[ "${SKIP_TRAIN_IF_FINAL}" == "1" && -d "${checkpoint_dir}/final" ]]; then
+    if [[ "${EVAL_ONLY}" == "1" ]]; then
+      if [[ ! -d "${checkpoint_dir}/final" ]]; then
+        echo "EVAL_ONLY=1 but checkpoint is missing: ${checkpoint_dir}/final" >&2
+        exit 1
+      fi
+      echo "Skip training because EVAL_ONLY=1."
+    elif [[ "${SKIP_TRAIN_IF_FINAL}" == "1" && -d "${checkpoint_dir}/final" ]]; then
       echo "Skip training because ${checkpoint_dir}/final exists."
     else
       run_or_print torchrun --nproc_per_node=1 --master_port="${master_port}" script/train/SFT_train.py \
@@ -227,6 +250,8 @@ echo "Start time: $(date)"
 echo "TMP_CONFIG_DIR=${TMP_CONFIG_DIR}"
 echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
 echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
+echo "EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS}"
+echo "EVAL_ONLY=${EVAL_ONLY}"
 echo "SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL}"
 echo "SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY}"
 echo "DRY_RUN=${DRY_RUN}"
