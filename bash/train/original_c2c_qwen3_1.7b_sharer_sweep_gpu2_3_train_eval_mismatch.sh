@@ -13,6 +13,8 @@ PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-4}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-64}
 EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS:-16}
 EVAL_ONLY=${EVAL_ONLY:-0}
+EVAL_USE_PHYSICAL_GPU_IDS=${EVAL_USE_PHYSICAL_GPU_IDS:-0}
+PHYSICAL_VISIBLE_DEVICES=${PHYSICAL_VISIBLE_DEVICES:-0,1,2,3}
 SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL:-1}
 SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY:-0}
 DRY_RUN=${DRY_RUN:-0}
@@ -63,6 +65,15 @@ with open(sys.argv[1]) as f:
 PY
 }
 
+yaml_get_gpu_ids() {
+  python - "$1" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1]) as f:
+    print(yaml.safe_load(f)["eval"]["gpu_ids"])
+PY
+}
+
 materialize_configs() {
   local idx="$1"
   local gpu="$2"
@@ -80,7 +91,8 @@ materialize_configs() {
     "${gpu}" \
     "${PER_DEVICE_BATCH_SIZE}" \
     "${GRAD_ACCUM_STEPS}" \
-    "${EVAL_MAX_NEW_TOKENS}" <<'PY'
+    "${EVAL_MAX_NEW_TOKENS}" \
+    "${EVAL_USE_PHYSICAL_GPU_IDS}" <<'PY'
 import json
 import re
 import sys
@@ -88,10 +100,11 @@ from pathlib import Path
 
 import yaml
 
-train_path, eval_path, mismatch_path, out_dir, gpu, batch_size, grad_accum, eval_max_new_tokens = sys.argv[1:9]
+train_path, eval_path, mismatch_path, out_dir, gpu, batch_size, grad_accum, eval_max_new_tokens, use_physical_gpu_ids = sys.argv[1:10]
 batch_size_i = int(batch_size)
 grad_accum_i = int(grad_accum)
 eval_max_new_tokens_i = int(eval_max_new_tokens)
+eval_gpu_id = int(gpu) if use_physical_gpu_ids == "1" else 0
 out = Path(out_dir)
 
 
@@ -135,7 +148,7 @@ def rewrite_eval(path: str, suffix: str):
     cfg.setdefault("model", {}).setdefault("generation_config", {})
     cfg["model"]["generation_config"]["do_sample"] = False
     cfg["model"]["generation_config"]["max_new_tokens"] = eval_max_new_tokens_i
-    cfg["eval"]["gpu_ids"] = [0]
+    cfg["eval"]["gpu_ids"] = [eval_gpu_id]
     cfg["eval"]["max_new_tokens"] = eval_max_new_tokens_i
     cfg["output"]["output_dir"] = apply_eval_suffix(cfg["output"]["output_dir"])
     if "dataset_cache_dir" in cfg["eval"]:
@@ -195,13 +208,23 @@ run_one() {
   (
     set -euo pipefail
     exec > >(tee -a "${job_log}") 2>&1
-    export CUDA_VISIBLE_DEVICES="${gpu}"
+    if [[ "${EVAL_USE_PHYSICAL_GPU_IDS}" == "1" ]]; then
+      if [[ "${EVAL_ONLY}" != "1" ]]; then
+        echo "EVAL_USE_PHYSICAL_GPU_IDS=1 requires EVAL_ONLY=1; refusing to train with all GPUs visible." >&2
+        exit 1
+      fi
+      export CUDA_VISIBLE_DEVICES="${PHYSICAL_VISIBLE_DEVICES}"
+    else
+      export CUDA_VISIBLE_DEVICES="${gpu}"
+    fi
     export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
 
     echo "Job: ${name}"
-    echo "Physical GPU: ${gpu}"
+    echo "Requested physical GPU: ${gpu}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    echo "EVAL_USE_PHYSICAL_GPU_IDS=${EVAL_USE_PHYSICAL_GPU_IDS}"
+    echo "Eval gpu_ids=$(yaml_get_gpu_ids "${eval_config}")"
     echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
     echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
     echo "EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS}"
@@ -215,7 +238,7 @@ run_one() {
     echo "Start time: $(date)"
 
     if [[ "${EVAL_ONLY}" == "1" ]]; then
-      if [[ ! -d "${checkpoint_dir}/final" ]]; then
+      if [[ "${DRY_RUN}" != "1" && ! -d "${checkpoint_dir}/final" ]]; then
         echo "EVAL_ONLY=1 but checkpoint is missing: ${checkpoint_dir}/final" >&2
         exit 1
       fi
@@ -252,6 +275,8 @@ echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}"
 echo "GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
 echo "EVAL_MAX_NEW_TOKENS=${EVAL_MAX_NEW_TOKENS}"
 echo "EVAL_ONLY=${EVAL_ONLY}"
+echo "EVAL_USE_PHYSICAL_GPU_IDS=${EVAL_USE_PHYSICAL_GPU_IDS}"
+echo "PHYSICAL_VISIBLE_DEVICES=${PHYSICAL_VISIBLE_DEVICES}"
 echo "SKIP_TRAIN_IF_FINAL=${SKIP_TRAIN_IF_FINAL}"
 echo "SKIP_EVAL_IF_SUMMARY=${SKIP_EVAL_IF_SUMMARY}"
 echo "DRY_RUN=${DRY_RUN}"
